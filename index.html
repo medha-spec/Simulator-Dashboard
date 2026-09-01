@@ -101,6 +101,36 @@
 
   .empty-note{ font-family:'IBM Plex Mono', monospace; font-size:11px; color:var(--text-faint); padding:10px 0; }
 
+  .sku-thumb{ width:94px; height:94px; border-radius:8px; object-fit:cover; background:var(--panel-2); border:1px solid var(--line); vertical-align:middle; cursor:zoom-in; transition:transform 0.15s; }
+  .sku-thumb:hover{ transform:scale(1.05); border-color:var(--amber); }
+  .sku-thumb-placeholder{ width:94px; height:94px; border-radius:8px; background:var(--panel-2); border:1px solid var(--line); display:inline-block; vertical-align:middle; }
+  .img-lightbox{ display:none; position:fixed; inset:0; background:rgba(10,12,10,0.92); z-index:1000; align-items:center; justify-content:center; cursor:zoom-out; }
+  .img-lightbox.open{ display:flex; }
+  .img-lightbox img{ max-width:90vw; max-height:90vh; border-radius:10px; border:1px solid var(--line); box-shadow:0 20px 60px rgba(0,0,0,0.5); }
+  .img-lightbox .lightbox-close{ position:absolute; top:24px; right:32px; color:var(--text); font-size:28px; cursor:pointer; font-family:'IBM Plex Mono', monospace; }
+  .sku-cell{ display:flex; align-items:center; gap:10px; text-align:left !important; }
+  .pareto-controls{ display:flex; align-items:center; gap:12px; padding:14px 0 18px; flex-wrap:wrap; }
+  .pareto-controls label{ font-family:'IBM Plex Mono', monospace; font-size:10px; text-transform:uppercase; letter-spacing:0.08em; color:var(--text-faint); margin-right:6px; }
+  .pareto-line{ background:var(--amber) !important; color:#111 !important; }
+  .pareto-line td{ border-top:2px solid var(--amber); border-bottom:2px solid var(--amber); font-weight:600; color:#111 !important; }
+  .quartile-summary{ display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-bottom:22px; }
+  @media(max-width:1000px){ .quartile-summary{ grid-template-columns:repeat(2,1fr);} }
+  .q-card{ background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; position:relative; overflow:hidden; }
+  .q-card::before{ content:''; position:absolute; left:0; top:0; bottom:0; width:3px; }
+  .q-card.q1::before{ background:var(--green); }
+  .q-card.q2::before{ background:var(--thread); }
+  .q-card.q3::before{ background:var(--amber-dim); }
+  .q-card.q4::before{ background:var(--red); }
+  .q-card .qlabel{ font-family:'Space Grotesk', sans-serif; font-size:15px; font-weight:600; }
+  .q-card .qsub{ font-family:'IBM Plex Mono', monospace; font-size:10px; color:var(--text-faint); margin-top:2px; text-transform:uppercase; letter-spacing:0.06em; }
+  .q-card .qval{ font-family:'Space Grotesk', sans-serif; font-size:22px; font-weight:600; margin-top:10px; }
+  .q-card .qmeta{ font-size:12px; color:var(--text-dim); margin-top:4px; }
+  .qtag{ font-family:'IBM Plex Mono', monospace; font-size:10px; padding:2px 7px; border-radius:4px; display:inline-block; }
+  .qtag.q1{ background:rgba(111,163,131,0.22); color:var(--green); }
+  .qtag.q2{ background:rgba(79,124,107,0.30); color:var(--thread); }
+  .qtag.q3{ background:rgba(232,163,61,0.22); color:var(--amber); }
+  .qtag.q4{ background:rgba(193,89,74,0.28); color:var(--red); }
+
   footer{ text-align:center; padding:24px; font-family:'IBM Plex Mono', monospace; font-size:11px;
           color:var(--text-faint); border-top:1px solid var(--line); }
   footer .warn{ color:var(--amber); }
@@ -137,6 +167,9 @@
     <button data-page="tracking">SALES TRACKING</button>
     <button data-page="summary">EXEC SUMMARY</button>
     <button data-page="returns">RETURNS</button>
+    <button data-page="analytics">ANALYTICS</button>
+    <button data-page="pareto">PARETO</button>
+    <button data-page="quartile">QUARTILE</button>
   </div>
   <div class="active-path" id="active-path"></div>
 </div>
@@ -155,7 +188,21 @@
   <div id="page-returns" style="display:none;">
     <div id="returns-root"></div>
   </div>
+  <div id="page-analytics" style="display:none;">
+    <div id="analytics-root"></div>
+  </div>
+  <div id="page-pareto" style="display:none;">
+    <div id="pareto-root"></div>
+  </div>
+  <div id="page-quartile" style="display:none;">
+    <div id="quartile-root"></div>
+  </div>
 </main>
+
+<div class="img-lightbox" id="img-lightbox" onclick="closeLightbox()">
+  <span class="lightbox-close">&times;</span>
+  <img id="img-lightbox-img" src="" alt="">
+</div>
 
 <footer>
   Rebuilt from Google Sheets via <b style="color:var(--thread)">build_data.py</b> &middot; V1.2<br>
@@ -202,14 +249,27 @@ function currentMonthKey(){
   return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0');
 }
 
-fetch('data/data.json').then(r => r.json()).then(json => {
-  DATA = json;
-  document.getElementById('stamp').innerHTML = 'Data as of <b>' + new Date(json.generated_at).toLocaleString() + '</b>';
+const DATA_PARTS = [
+  'data/meta.json', 'data/sales.json', 'data/sales_by_sku.json',
+  'data/inventory.json', 'data/pipeline.json', 'data/returns_actual.json', 'data/targets.json'
+];
+
+Promise.all(DATA_PARTS.map(url => fetch(url).then(r => {
+  if (!r.ok) throw new Error(`Failed to load ${url}: ${r.status}`);
+  return r.json();
+})))
+.then(parts => {
+  DATA = Object.assign({}, ...parts); // merge all parts into one object, same shape as the old single data.json
+  document.getElementById('stamp').innerHTML = 'Data as of <b>' + new Date(DATA.generated_at).toLocaleString() + '</b>';
   buildLearnedReturns();
   applyReturnsAdjustment();
   buildIndexes();
   populateFilters();
   render();
+})
+.catch(err => {
+  console.error('Failed to load dashboard data:', err);
+  document.getElementById('stamp').textContent = 'Failed to load data — see console (F12) for details';
 });
 
 // Reduces Actual Sales AND Target down to net-of-returns, at Channel x L1 x
@@ -360,6 +420,9 @@ function populateFilters(){
       document.getElementById('page-tracking').style.display = currentPage === 'tracking' ? '' : 'none';
       document.getElementById('page-summary').style.display = currentPage === 'summary' ? '' : 'none';
       document.getElementById('page-returns').style.display = currentPage === 'returns' ? '' : 'none';
+      document.getElementById('page-analytics').style.display = currentPage === 'analytics' ? '' : 'none';
+      document.getElementById('page-pareto').style.display = currentPage === 'pareto' ? '' : 'none';
+      document.getElementById('page-quartile').style.display = currentPage === 'quartile' ? '' : 'none';
       render();
     });
   });
@@ -565,7 +628,7 @@ function render(){
   document.getElementById('active-path').textContent =
     'Filter: ' + ([f.channel, f.l1, f.cat, f.m1, f.m2, f.m3].filter(v => v !== 'ALL').join(' → ') || 'All data');
 
-  const sales = DATA.sales.filter(r => salesMatches(r, f));
+  const sales = DATA.sales.filter(r => salesMatches(r, f) && MONTHS.includes(r.month));
   const { qtyField, valField } = invFieldsForChannel(f.channel);
   const allLeafKeys = new Set([...Object.keys(leafIndex), ...Object.keys(pipelineIndex)]);
   const leafKeysMatchingFilter = [...allLeafKeys].filter(k => {
@@ -580,6 +643,14 @@ function render(){
     renderTracking(sales, leafKeysMatchingFilter, f, qtyField, valField);
   } else if (currentPage === 'summary'){
     renderExecSummary();
+  } else if (currentPage === 'analytics'){
+    renderAnalyticsTab();
+  } else if (currentPage === 'pareto'){
+    const salesBySku = (DATA.sales_by_sku || []).filter(r => salesMatches(r, f));
+    renderParetoTab(salesBySku, f);
+  } else if (currentPage === 'quartile'){
+    const salesBySku = (DATA.sales_by_sku || []).filter(r => salesMatches(r, f));
+    renderQuartileTab(salesBySku, f);
   } else {
     renderReturnsTab();
   }
@@ -599,7 +670,7 @@ function monthFraction(monthKey){
 
 function computeTrackingLedger(entity, f, qtyField, valField){
   const valKey = metric === 'qty' ? 'qty' : 'cogs_sold';
-  const target = [], actual = [], tillDateTarget = [], delta = [];
+  const target = [], actual = [], tillDateTarget = [], delta = [], pctAchieved = [], projection = [];
   MONTHS.forEach(m => {
     const t = targetForLeafSet(entity.leafKeys, f.channel, m, qtyField, valField);
     const matched = entity.salesRows.filter(x => x.month === m);
@@ -614,8 +685,24 @@ function computeTrackingLedger(entity, f, qtyField, valField){
       tillDateTarget.push(tdt);
       delta.push(tdt - a);
     }
+
+    // % Achieved -- against the till-date (pro-rated) target, so a mid-month
+    // check reads as "on pace" at 100%, not artificially low vs the full-month target.
+    const tdtForPct = t !== null ? t * monthFraction(m) : null;
+    pctAchieved.push((tdtForPct !== null && tdtForPct > 0) ? (a / tdtForPct * 100) : null);
+
+    // Run-rate projection -- ONLY for the CURRENT partial month: (sales this
+    // month till date) x (total days in month / current day of month). Past
+    // and future months show "—" here (past months' actual is already shown
+    // in the Sales Actual block above; future months have no rate to extrapolate).
+    const frac = monthFraction(m);
+    if (frac > 0 && frac < 1 && a > 0){
+      projection.push(a / frac);
+    } else {
+      projection.push(null);
+    }
   });
-  return { target, actual, tillDateTarget, delta };
+  return { target, actual, tillDateTarget, delta, pctAchieved, projection };
 }
 
 function deltaCell(v){
@@ -708,7 +795,7 @@ function renderKPIs(sales, leafKeys, qtyField, valField, f){
 }
 
 let sortState = {}; // cardId -> {mode:'meta', key, dir} | {mode:'value', blockKey, monthIndex, dir}
-const DIM_LABELS = {l1:'L1', cat:'Category', m1:'Meta1', m2:'Meta2', m3:'Meta3'};
+const DIM_LABELS = {l1:'L1', cat:'Category', m1:'Meta1', m2:'Meta2', m3:'Meta3', channel:'Channel', asp_band:'ASP Band'};
 
 const DASHBOARD_BLOCKS = [
   {key:'opening', title:'Opening'},
@@ -724,6 +811,8 @@ const TRACKING_BLOCKS = [
   {key:'tillDateTarget', title:'Sales Target (Till-Date)', note:true},
   {key:'actual', title:'Sales (Actual)'},
   {key:'delta', title:'Sales Left to Achieve (Till-Date)', note:true, isDelta:true},
+  {key:'pctAchieved', title:'% Achieved (vs Till-Date Target)', note:true, isPercent:true},
+  {key:'projection', title:'Projected Full-Month (Run-Rate)', note:true, isProjection:true},
 ];
 
 function buildEntities(def, sales, leafKeys){
@@ -805,6 +894,20 @@ function renderCellForBlock(blockDef, ledger, i){
     const cls = v>0?'delta-behind':(v<0?'delta-ahead':'');
     return `<td class="${cls}">${v>0?'+':''}${fmtNum(v)}</td>`;
   }
+  if (blockDef.isPercent){
+    if (v===null||v===undefined) return `<td class="dash">—</td>`;
+    // Color scale: 100% = on-pace (neutral-ish green), scales red the further under, green the further over.
+    const diff = v - 100;
+    const intensity = Math.min(Math.abs(diff) / 50, 1);
+    const bg = diff >= 0
+      ? `rgba(111,163,131,${(0.10 + intensity*0.35).toFixed(2)})`
+      : `rgba(193,89,74,${(0.10 + intensity*0.35).toFixed(2)})`;
+    return `<td style="background:${bg};">${v.toFixed(1)}%</td>`;
+  }
+  if (blockDef.isProjection){
+    if (v===null||v===undefined) return `<td class="dash">—</td>`;
+    return `<td>${fmtNum(v)}</td>`;
+  }
   return (v===null||v===undefined) ? `<td class="dash">—</td>` : `<td>${fmtNum(v)}</td>`;
 }
 
@@ -818,6 +921,16 @@ function computeTotal(rows, ledgers, blockDef, monthIndex){
     });
     if (!any || !targetSum) return null;
     return closingSum * 30 / targetSum;
+  }
+  if (blockDef.isPercent){
+    // Recompute from underlying actual/till-date-target sums, not an average of %s.
+    let actualSum = 0, tdtSum = null;
+    rows.forEach(r => {
+      const l = ledgers.get(r);
+      actualSum += l.actual[monthIndex] || 0;
+      if (l.tillDateTarget[monthIndex] !== null) tdtSum = (tdtSum||0) + l.tillDateTarget[monthIndex];
+    });
+    return (tdtSum && tdtSum > 0) ? (actualSum / tdtSum * 100) : null;
   }
   let sum = null;
   rows.forEach(r => {
@@ -850,6 +963,7 @@ function pivotBlockV2(blockDef, rows, def, ledgers, cardId, sortSpec){
       const cls = t>0?'delta-behind':(t<0?'delta-ahead':'');
       return `<td class="${cls}">${t>0?'+':''}${fmtNum(t)}</td>`;
     }
+    if (blockDef.isPercent) return `<td>${t.toFixed(1)}%</td>`;
     return `<td>${fmtNum(t)}</td>`;
   }).join('');
 
@@ -946,7 +1060,7 @@ function renderExecSummary(){
   const globalF = {channel:'ALL', l1:'ALL', cat:'ALL', m1:'ALL', m2:'ALL', m3:'ALL'};
   const allLeafKeys = Object.keys(leafIndex);
   const qtyField = 'total_qty', valField = 'total_value';
-  const wholeBusiness = { values: {l1:'Whole Business'}, salesRows: DATA.sales, leafKeys: allLeafKeys };
+  const wholeBusiness = { values: {l1:'Whole Business'}, salesRows: DATA.sales.filter(r => MONTHS.includes(r.month)), leafKeys: allLeafKeys };
   const ledger = computeLedger(wholeBusiness, globalF, qtyField, valField);
   const ledgers = new Map([[wholeBusiness, ledger]]);
   const fakeDef = { dims: ['l1'] };
@@ -1057,6 +1171,785 @@ function renderExecSummary(){
       render();
     });
   });
+}
+
+// ===========================================================================
+// ANALYTICS TAB -- DoD / WoW / MTD / MoM across Sales, Returns (actual, from
+// Snowflake RETURNS_DATA), Inv changes, DOI, STR, sliced by 9 dimensions.
+// Pipeline metric shows "—" everywhere until daily-grain pipeline data lands
+// (per Aditya, coming later) -- flagged in the metric list below.
+// ===========================================================================
+let analyticsPeriod = 'mtd';   // 'dod' | 'wow' | 'mtd' | 'mom'
+let analyticsMetric = 'sales'; // 'sales' | 'returns' | 'pipeline' | 'inv' | 'doi' | 'str'
+let analyticsDimId = 'channel';
+let analyticsCustomStart = null;
+let analyticsCustomEnd = null;
+
+const ANALYTICS_DIMS = [
+  {id:'channel', label:'Channel',                    dims:['channel']},
+  {id:'l1cat',   label:'L1 × Category',               dims:['l1','cat']},
+  {id:'cat',     label:'Category',                    dims:['cat']},
+  {id:'catm1',   label:'Category × Meta1',            dims:['cat','m1']},
+  {id:'catm123', label:'Category × Meta1 × Meta2 × Meta3', dims:['cat','m1','m2','m3']},
+  {id:'l1catm123', label:'L1 × Category × Meta1 × Meta2 × Meta3', dims:['l1','cat','m1','m2','m3']},
+  {id:'catm2',   label:'Category × Meta2',            dims:['cat','m2']},
+  {id:'catm3',   label:'Category × Meta3',            dims:['cat','m3']},
+  {id:'asp',     label:'ASP Band',                    dims:['asp_band']},
+];
+
+const ANALYTICS_METRICS = [
+  {id:'sales',    label:'Sales'},
+  {id:'returns',  label:'Returns (actual)'},
+  {id:'pipeline', label:'Currently in Pipeline', pending:true},
+  {id:'inv',      label:'Inv Changes'},
+  {id:'doi',      label:'DOI (current)'},
+  {id:'str',      label:'STR'},
+];
+
+const ASP_BANDS = [
+  {label:'<500', min:0, max:500},
+  {label:'500–999', min:500, max:1000},
+  {label:'1000–1499', min:1000, max:1500},
+  {label:'1500–1999', min:1500, max:2000},
+  {label:'2000+', min:2000, max:Infinity},
+];
+function aspBandFor(gross, qty){
+  if (!qty) return null;
+  const asp = gross / qty;
+  const band = ASP_BANDS.find(b => asp >= b.min && asp < b.max);
+  return band ? band.label : null;
+}
+
+function isoAddDays(iso, n){
+  const d = new Date(iso + 'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0,10);
+}
+function latestDataDate(){
+  let latest = null;
+  DATA.sales.forEach(r => { if (r.date && (!latest || r.date > latest)) latest = r.date; });
+  return latest || new Date().toISOString().slice(0,10);
+}
+// Returns {curStart, curEnd, priorStart, priorEnd, label} -- all inclusive, 'YYYY-MM-DD'.
+function analyticsPeriodRange(period, customStart, customEnd){
+  const latest = latestDataDate();
+  if (period === 'custom' && customStart && customEnd){
+    const days = (new Date(customEnd) - new Date(customStart)) / 86400000 + 1;
+    return {
+      curStart: customStart, curEnd: customEnd,
+      priorStart: isoAddDays(customStart, -days), priorEnd: isoAddDays(customStart, -1),
+      label: `Custom range vs the ${days}-day period immediately before it`
+    };
+  }
+  if (period === 'dod'){
+    return { curStart: latest, curEnd: latest, priorStart: isoAddDays(latest,-1), priorEnd: isoAddDays(latest,-1),
+      label: `Today (${latest}) vs Yesterday (${isoAddDays(latest,-1)})` };
+  }
+  if (period === 'wow'){
+    return { curStart: isoAddDays(latest,-6), curEnd: latest, priorStart: isoAddDays(latest,-13), priorEnd: isoAddDays(latest,-7),
+      label: `This week (last 7 days) vs Last week (the 7 days before that)` };
+  }
+  if (period === 'mtd'){
+    const [y,m,d] = latest.split('-');
+    const monthStart = `${y}-${m}-01`;
+    const prevMonth = monthMinus(`${y}-${m}`, 1);
+    const priorStart = prevMonth + '-01';
+    const priorEnd = prevMonth + '-' + d; // same day-of-month, best effort
+    return { curStart: monthStart, curEnd: latest, priorStart, priorEnd,
+      label: `This month, 1st → today, vs the same day-count last month` };
+  }
+  // mom: last FULL completed month vs the month before it
+  const curMonthKey = latest.slice(0,7);
+  const lastFull = monthMinus(curMonthKey, 1);
+  const priorFull = monthMinus(curMonthKey, 2);
+  return { curStart: lastFull+'-01', curEnd: lastFull+'-31', priorStart: priorFull+'-01', priorEnd: priorFull+'-31',
+    label: `Last full month (${lastFull}) vs the month before it (${priorFull})` };
+}
+
+function analyticsRowMatchesFilter(row, f){
+  if (f.channel !== 'ALL' && row.channel && row.channel !== f.channel) return false;
+  if (f.l1 !== 'ALL' && row.l1 !== f.l1) return false;
+  if (f.cat !== 'ALL' && row.cat !== f.cat) return false;
+  if (f.m1 !== 'ALL' && row.m1 !== f.m1) return false;
+  if (f.m2 !== 'ALL' && row.m2 !== f.m2) return false;
+  if (f.m3 !== 'ALL' && row.m3 !== f.m3) return false;
+  return true;
+}
+
+function groupKeyForAnalytics(row, dims){
+  return dims.map(d => {
+    if (d === 'asp_band') return row.asp_band ?? '(n/a)';
+    return row[d] ?? '(none)';
+  }).join(' | ');
+}
+
+// Sums qty/value for `records` (must have .date) within [start,end] inclusive,
+// grouped by dimDef.dims. valueField picks which numeric field to sum.
+function sumByDim(records, dimDef, f, start, end, qtyField, valField){
+  const out = {}; // key -> {label, dimValues, qty, value}
+  records.forEach(r => {
+    if (!r.date || r.date < start || r.date > end) return;
+    if (!analyticsRowMatchesFilter(r, f)) return;
+    if (dimDef.id === 'asp' && r.asp_band == null) return;
+    const gk = groupKeyForAnalytics(r, dimDef.dims);
+    if (!out[gk]){
+      const dimValues = {};
+      dimDef.dims.forEach(d => { dimValues[d] = d==='asp_band' ? (r.asp_band ?? '(n/a)') : (r[d] ?? '(none)'); });
+      out[gk] = { label: Object.values(dimValues).join(' × '), dimValues, qty: 0, value: 0 };
+    }
+    out[gk].qty += r[qtyField] || 0;
+    out[gk].value += r[valField] || 0;
+  });
+  return out;
+}
+
+// Precompute ASP band per sales row (cached on the row itself).
+function ensureAspBands(){
+  DATA.sales.forEach(r => { if (r.asp_band === undefined) r.asp_band = aspBandFor(r.gross_sales_gross ?? r.gross_sales, r.qty_gross ?? r.qty); });
+  (DATA.returns_actual || []).forEach(r => { if (r.asp_band === undefined) r.asp_band = aspBandFor(r.sales_value, r.sales_qty); });
+}
+
+// Per-render cache -- reset at the top of renderAnalyticsTab(). Sales/Inv sums
+// are expensive (full scans over 180K+ sales rows / thousands of inventory
+// leaves) and were being recomputed redundantly by DOI and STR on top of the
+// direct Sales/Inv metric calls -- this was crashing the tab. Cache once.
+let analyticsCache = {};
+function cacheKey(prefix, dimDef, f, range){
+  return [prefix, dimDef.id, f.channel, f.l1, f.cat, f.m1, f.m2, f.m3, range.curStart, range.curEnd, range.priorStart, range.priorEnd].join('|');
+}
+
+function computeAnalyticsSales(dimDef, f, range){
+  const key = cacheKey('sales', dimDef, f, range);
+  if (analyticsCache[key]) return analyticsCache[key];
+  ensureAspBands();
+  const valField = metric === 'qty' ? 'qty' : 'gross_sales';
+  const cur = sumByDim(DATA.sales, dimDef, f, range.curStart, range.curEnd, 'qty', valField);
+  const prior = sumByDim(DATA.sales, dimDef, f, range.priorStart, range.priorEnd, 'qty', valField);
+  return analyticsCache[key] = { cur, prior, valField };
+}
+
+function computeAnalyticsReturns(dimDef, f, range){
+  ensureAspBands();
+  const recs = DATA.returns_actual || [];
+  const cur = sumByDim(recs, dimDef, f, range.curStart, range.curEnd, 'return_qty', 'return_qty');
+  const prior = sumByDim(recs, dimDef, f, range.priorStart, range.priorEnd, 'return_qty', 'return_qty');
+  return { cur, prior, valField: 'return_qty' };
+}
+
+// Inv changes: closing qty (latest snapshot on/before end date, per leaf) at
+// curEnd vs priorEnd, grouped by dimDef.dims (l1/cat/m1/m2/m3 dims only --
+// inventory has no 'channel' column, so channel dim falls back to total_qty).
+// Binary search since leafIndex[lk] is sorted ascending by date (buildIndexes
+// sorts it once at load) -- was a full linear scan per call before, which is
+// what made this crash the tab once combined with DOI/STR calling it repeatedly.
+function closingQtyAt(leafKey, dateIso, qtyField){
+  const recs = leafIndex[leafKey];
+  if (!recs || !recs.length) return null;
+  let lo = 0, hi = recs.length - 1, best = -1;
+  while (lo <= hi){
+    const mid = (lo + hi) >> 1;
+    if (recs[mid].date <= dateIso){ best = mid; lo = mid + 1; }
+    else hi = mid - 1;
+  }
+  return best >= 0 ? (recs[best][qtyField] || 0) : null;
+}
+function computeAnalyticsInv(dimDef, f, range){
+  const key = cacheKey('inv', dimDef, f, range);
+  if (analyticsCache[key]) return analyticsCache[key];
+  const { qtyField } = invFieldsForChannel(f.channel);
+  const out = { cur: {}, prior: {} };
+  Object.keys(leafIndex).forEach(lk => {
+    const rec = leafIndex[lk][0];
+    if (!analyticsRowMatchesFilter(rec, f)) return;
+    if (dimDef.id === 'asp') return; // ASP band not meaningful for a point-in-time inv snapshot here
+    const gk = groupKeyForAnalytics(rec, dimDef.dims);
+    const dimValues = {};
+    dimDef.dims.forEach(d => { dimValues[d] = rec[d] ?? '(none)'; });
+    const label = Object.values(dimValues).join(' × ');
+    const curQ = closingQtyAt(lk, range.curEnd, qtyField);
+    const priQ = closingQtyAt(lk, range.priorEnd, qtyField);
+    if (curQ !== null){ (out.cur[gk] = out.cur[gk] || {label, dimValues, qty:0, value:0}); out.cur[gk].qty += curQ; }
+    if (priQ !== null){ (out.prior[gk] = out.prior[gk] || {label, dimValues, qty:0, value:0}); out.prior[gk].qty += priQ; }
+  });
+  return analyticsCache[key] = { cur: out.cur, prior: out.prior, valField: 'qty' };
+}
+
+// DOI = Closing Qty (at period end) / (period sales qty / days in period) --
+// "days of inventory" at the sales rate actually observed in that period.
+function computeAnalyticsDOI(dimDef, f, range){
+  const salesRes = computeAnalyticsSales(dimDef, f, range);
+  const invRes = computeAnalyticsInv(dimDef, f, range);
+  const days = (new Date(range.curEnd) - new Date(range.curStart)) / 86400000 + 1;
+  const out = { cur: {}, prior: {} };
+  const allKeys = new Set([...Object.keys(salesRes.cur), ...Object.keys(invRes.cur)]);
+  allKeys.forEach(gk => {
+    const s = salesRes.cur[gk], i = invRes.cur[gk];
+    if (!s || !i || !s.qty) return;
+    const rate = s.qty / days;
+    out.cur[gk] = { label: i.label || s.label, qty: rate > 0 ? i.qty / rate : null, value: 0 };
+  });
+  // "prior" for DOI shown as the same calc over the prior window, for comparison
+  const priorDays = (new Date(range.priorEnd) - new Date(range.priorStart)) / 86400000 + 1;
+  const allKeysP = new Set([...Object.keys(salesRes.prior), ...Object.keys(invRes.prior)]);
+  allKeysP.forEach(gk => {
+    const s = salesRes.prior[gk], i = invRes.prior[gk];
+    if (!s || !i || !s.qty) return;
+    const rate = s.qty / priorDays;
+    out.prior[gk] = { label: i.label || s.label, qty: rate > 0 ? i.qty / rate : null, value: 0 };
+  });
+  return { cur: out.cur, prior: out.prior, valField: 'qty', isDays: true };
+}
+
+// STR = period Sold Qty / (period Sold Qty + Closing Qty at period end)
+function computeAnalyticsSTR(dimDef, f, range){
+  const salesRes = computeAnalyticsSales(dimDef, f, range);
+  const invRes = computeAnalyticsInv(dimDef, f, range);
+  const out = { cur: {}, prior: {} };
+  Object.keys(salesRes.cur).forEach(gk => {
+    const s = salesRes.cur[gk], i = invRes.cur[gk];
+    const closingQty = i ? i.qty : 0;
+    const denom = s.qty + closingQty;
+    out.cur[gk] = { label: s.label, qty: denom > 0 ? (s.qty/denom*100) : null, value: 0 };
+  });
+  Object.keys(salesRes.prior).forEach(gk => {
+    const s = salesRes.prior[gk], i = invRes.prior[gk];
+    const closingQty = i ? i.qty : 0;
+    const denom = s.qty + closingQty;
+    out.prior[gk] = { label: s.label, qty: denom > 0 ? (s.qty/denom*100) : null, value: 0 };
+  });
+  return { cur: out.cur, prior: out.prior, valField: 'qty', isPct: true };
+}
+
+function computeMetricForDim(metricId, dimDef, f, range){
+  if (metricId === 'sales') return computeAnalyticsSales(dimDef, f, range);
+  if (metricId === 'returns') return computeAnalyticsReturns(dimDef, f, range);
+  if (metricId === 'inv') return computeAnalyticsInv(dimDef, f, range);
+  if (metricId === 'doi') return computeAnalyticsDOI(dimDef, f, range);
+  if (metricId === 'str') return computeAnalyticsSTR(dimDef, f, range);
+  return null; // pipeline -- pending
+}
+
+function renderAnalyticsTab(){
+  analyticsCache = {}; // reset memoization cache for this render pass
+  const root = document.getElementById('analytics-root');
+  root.innerHTML = '';
+
+  const controls = document.createElement('div');
+  controls.className = 'card-section';
+  controls.innerHTML = `
+    <div style="display:flex; gap:20px; flex-wrap:wrap; align-items:flex-end; margin-bottom:10px;">
+      <div class="filter-group"><label>Period</label>
+        <select id="an-period">
+          <option value="dod">Day-on-Day</option>
+          <option value="wow">Week-on-Week</option>
+          <option value="mtd">MTD</option>
+          <option value="mom">Month-on-Month</option>
+          <option value="custom">Custom Range</option>
+        </select>
+      </div>
+      <div class="filter-group" id="an-custom-start" style="display:none;"><label>From</label>
+        <input type="date" id="an-date-start" style="background:var(--panel-2); border:1px solid var(--line); color:var(--text); padding:8px 10px; border-radius:6px; font-family:'IBM Plex Mono', monospace; font-size:12px;">
+      </div>
+      <div class="filter-group" id="an-custom-end" style="display:none;"><label>To</label>
+        <input type="date" id="an-date-end" style="background:var(--panel-2); border:1px solid var(--line); color:var(--text); padding:8px 10px; border-radius:6px; font-family:'IBM Plex Mono', monospace; font-size:12px;">
+      </div>
+    </div>
+    <div class="empty-note" id="an-period-label" style="color:var(--thread); font-weight:600;"></div>
+    <div class="empty-note" id="an-range-note"></div>
+    <div class="empty-note">Inv Changes / DOI / STR use Closing Qty (latest inventory snapshot on/before the period-end date) — "Current" = snapshot at the current period's end date, "Comparison" = snapshot at the comparison period's end date. Color: green = improved vs comparison, red = declined.</div>
+  `;
+  root.appendChild(controls);
+  document.getElementById('an-period').value = analyticsPeriod;
+  document.getElementById('an-period').addEventListener('change', e => {
+    analyticsPeriod = e.target.value;
+    render();
+  });
+
+  const showCustom = analyticsPeriod === 'custom';
+  document.getElementById('an-custom-start').style.display = showCustom ? '' : 'none';
+  document.getElementById('an-custom-end').style.display = showCustom ? '' : 'none';
+  if (showCustom){
+    const latest = latestDataDate();
+    const startEl = document.getElementById('an-date-start');
+    const endEl = document.getElementById('an-date-end');
+    startEl.value = analyticsCustomStart || isoAddDays(latest, -6);
+    endEl.value = analyticsCustomEnd || latest;
+    startEl.addEventListener('change', e => { analyticsCustomStart = e.target.value; render(); });
+    endEl.addEventListener('change', e => { analyticsCustomEnd = e.target.value; render(); });
+  }
+
+  const f = getFilters();
+  const range = analyticsPeriodRange(analyticsPeriod, analyticsCustomStart, analyticsCustomEnd);
+  document.getElementById('an-period-label').textContent = range.label || '';
+  document.getElementById('an-range-note').textContent =
+    `Current window: ${range.curStart} → ${range.curEnd}   |   Comparison window: ${range.priorStart} → ${range.priorEnd}`;
+
+  ANALYTICS_DIMS.forEach(dimDef => {
+    const section = document.createElement('div');
+    section.className = 'card-section';
+
+    // Compute all 6 metrics for this dimension up front
+    const metricResults = {};
+    ANALYTICS_METRICS.forEach(m => { metricResults[m.id] = m.pending ? null : computeMetricForDim(m.id, dimDef, f, range); });
+
+    // Union of every row-key seen across all metrics, so a dimension value
+    // shows up even if only one metric has data for it.
+    const allKeys = new Set();
+    let labelByKey = {}, dimValuesByKey = {};
+    ANALYTICS_METRICS.forEach(m => {
+      const res = metricResults[m.id];
+      if (!res) return;
+      Object.entries(res.cur).forEach(([gk,v]) => { allKeys.add(gk); labelByKey[gk] = v.label; dimValuesByKey[gk] = v.dimValues || {}; });
+    });
+
+    if (allKeys.size === 0){
+      section.innerHTML = `<h2>${dimDef.label} <span class="rule"></span><span class="count">no data</span></h2>
+        <div class="empty-note">No rows for this dimension in the selected period/filters.</div>`;
+      root.appendChild(section);
+      return;
+    }
+
+    const rows = [...allKeys].map(gk => {
+      const cells = ANALYTICS_METRICS.map(m => {
+        const res = metricResults[m.id];
+        if (!res) return { pending: true };
+        const c = res.cur[gk];
+        const p = res.prior[gk];
+        const cVal = c ? c.qty : null, pVal = p ? p.qty : null;
+        const pctChange = (cVal !== null && pVal) ? ((cVal-pVal)/pVal*100) : null;
+        return { cVal, pVal, pctChange, isPct: res.isPct, isDays: res.isDays };
+      });
+      // sort by the Sales column's current value, descending
+      const sortVal = cells[0].cVal || 0;
+      return { label: labelByKey[gk] || gk, cells, sortVal };
+    }).sort((a,b) => b.sortVal - a.sortVal);
+
+    const fmtVal = (v, cell) => {
+      if (v === null || v === undefined) return '—';
+      return cell.isPct ? v.toFixed(1)+'%' : cell.isDays ? v.toFixed(0)+'d' : fmtNum(v);
+    };
+
+    // Two <td>s per metric: Current (colored by change) | Comparison (plain),
+    // with a left border on the pair to visually separate metric groups.
+    const fmtCellPair = (cell, metricId) => {
+      const borderStyle = 'border-left:2px solid var(--line);';
+      if (cell.pending) return `<td style="${borderStyle}" class="dash">— (pending)</td><td class="dash">—</td>`;
+      if (cell.cVal === null || cell.cVal === undefined){
+        return `<td style="${borderStyle}" class="dash">—</td><td class="dash">${fmtVal(cell.pVal, cell)}</td>`;
+      }
+      let bg = '', color = '';
+      if (cell.pctChange !== null){
+        // For Returns and DOI, a rise is BAD (more returns / more stuck stock);
+        // for everything else, a rise is GOOD. Flips which color means "up".
+        const invert = metricId === 'returns' || metricId === 'doi';
+        const isGood = invert ? cell.pctChange < 0 : cell.pctChange > 0;
+        const isBad = invert ? cell.pctChange > 0 : cell.pctChange < 0;
+        const intensity = Math.min(Math.abs(cell.pctChange) / 50, 1); // caps at ±50% change
+        if (isGood){ bg = `rgba(111,163,131,${(0.10 + intensity*0.35).toFixed(2)})`; color = 'var(--green)'; }
+        else if (isBad){ bg = `rgba(193,89,74,${(0.10 + intensity*0.35).toFixed(2)})`; color = 'var(--red)'; }
+      }
+      const pctTxt = cell.pctChange === null ? '' :
+        ` <span style="font-size:10px; color:${color||'inherit'};">(${cell.pctChange>0?'+':''}${cell.pctChange.toFixed(1)}%)</span>`;
+      return `<td style="${borderStyle} background:${bg};">${fmtVal(cell.cVal, cell)}${pctTxt}</td><td style="color:var(--text-dim);">${fmtVal(cell.pVal, cell)}</td>`;
+    };
+
+    section.innerHTML = `
+      <h2>${dimDef.label} <span class="rule"></span><span class="count">${rows.length} rows</span></h2>
+      <div class="pivot-strip">
+        <div class="pivot-block" style="min-width:100%;">
+          <table class="ptable">
+            <thead>
+              <tr>
+                <th style="text-align:left;" rowspan="2">${dimDef.label}</th>
+                ${ANALYTICS_METRICS.map(m => `<th colspan="2" style="border-left:2px solid var(--line); text-align:center;">${m.label}</th>`).join('')}
+              </tr>
+              <tr>
+                ${ANALYTICS_METRICS.map(() => `<th style="border-left:2px solid var(--line); font-size:9px;">Current</th><th style="font-size:9px; color:var(--text-faint);">Compare</th>`).join('')}
+              </tr>
+            </thead>
+            <tbody>
+              ${rows.map(r => `<tr>
+                <td class="rowlabel">${r.label}</td>
+                ${r.cells.map((cell,i) => fmtCellPair(cell, ANALYTICS_METRICS[i].id)).join('')}
+              </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    `;
+    root.appendChild(section);
+  });
+}
+
+// ===========================================================================
+// PARETO + QUARTILE TABS -- sku_group level ranking, respects the active
+// filter rail (Channel/L1/Category/Meta1/2/3) exactly like every other tab.
+// Images come from DATA.images (sku_group -> CDN url), built by build_data.py
+// from the new_meafields_product_products_graph_ql media query.
+// ===========================================================================
+const PARETO_METRICS = [
+  {id:'gross_sales', label:'Gross Sales (\u20b9)'},
+  {id:'qty',          label:'Qty'},
+  {id:'cogs_sold',    label:'COGS (\u20b9)'},
+  {id:'mrp_value',    label:'MRP Value (\u20b9)'},
+];
+let paretoMetric = 'gross_sales';
+let paretoCountPctLimit = 100;   // slider: show only SKUs within the top X% of SKU COUNT
+let quartileCountPctLimit = 100;
+// Date range defaults: last ~90 days of available data, resolved to full
+// months when applied (sales_by_sku/returns_by_sku are monthly grain).
+// Left null until first render of either tab (DATA isn't loaded yet when this
+// script first runs) -- see ensureParetoDateDefaults().
+let paretoDateStart = null, paretoDateEnd = null;
+let quartileDateStart = null, quartileDateEnd = null;
+function ensureParetoDateDefaults(){
+  if (paretoDateStart === null){
+    paretoDateEnd = latestDataDate();
+    paretoDateStart = isoAddDays(paretoDateEnd, -89);
+  }
+  if (quartileDateStart === null){
+    quartileDateEnd = latestDataDate();
+    quartileDateStart = isoAddDays(quartileDateEnd, -89);
+  }
+}
+let paretoSort = {key:'metric_value', dir:'desc'};
+let quartileSort = {key:'metric_value', dir:'desc'};
+
+function skuThumb(skuGroup){
+  const url = (DATA.images || {})[skuGroup];
+  return url
+    ? `<img class="sku-thumb" src="${url}" alt="${skuGroup}" loading="lazy" onclick="event.stopPropagation(); openLightbox('${url.replace(/'/g,"\\'")}', '${skuGroup.replace(/'/g,"\\'")}')" onerror="this.outerHTML='<span class=&quot;sku-thumb-placeholder&quot;></span>';">`
+    : `<span class="sku-thumb-placeholder"></span>`;
+}
+
+function openLightbox(url, alt){
+  const box = document.getElementById('img-lightbox');
+  const img = document.getElementById('img-lightbox-img');
+  img.src = url;
+  img.alt = alt;
+  box.classList.add('open');
+}
+function closeLightbox(){
+  document.getElementById('img-lightbox').classList.remove('open');
+}
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeLightbox(); });
+
+// Aggregates already-filtered sales_by_sku rows (from render(), which applied
+// salesMatches(row,f) + MONTHS) down to one row per sku_group, summing EVERY
+// numeric field (not just the selected metric) so any column can be sorted,
+// and attaches the matching Returns figure for that sku_group.
+function aggregateBySkuGroup(salesBySku, returnsMap){
+  const byGroup = {};
+  salesBySku.forEach(r => {
+    if (!r.sku_group) return;
+    const g = byGroup[r.sku_group] || (byGroup[r.sku_group] = {
+      sku_group: r.sku_group, l1: r.l1, cat: r.cat, m1: r.m1, m2: r.m2, m3: r.m3,
+      gross_sales: 0, qty: 0, cogs_sold: 0, mrp_value: 0
+    });
+    g.gross_sales += (r.gross_sales || 0);
+    g.qty += (r.qty || 0);
+    g.cogs_sold += (r.cogs_sold || 0);
+    g.mrp_value += (r.mrp_value || 0);
+  });
+  Object.values(byGroup).forEach(g => {
+    g.return_qty = returnsMap[g.sku_group] || 0;
+  });
+  return Object.values(byGroup);
+}
+
+// Builds sku_group -> total return_qty for the currently-active period (MONTHS
+// window, same as sales_by_sku's own filtering -- returns_by_sku isn't
+// channel/L1/Cat-filterable since it's channel-agnostic overall qty only, so
+// this is applied regardless of the Channel/L1/Cat filter rail selections).
+// Sales-by-sku and returns-by-sku are both monthly grain, so a calendar date
+// range gets resolved to the full months it overlaps (inclusive). Flagged to
+// the user in the UI note below -- day-level precision isn't available here.
+function monthsInRange(startDate, endDate){
+  const months = [];
+  let m = startDate.slice(0,7);
+  const endM = endDate.slice(0,7);
+  while (m <= endM){
+    months.push(m);
+    m = monthMinus(m, -1); // step forward one month
+  }
+  return months;
+}
+
+function buildReturnsBySkuMap(monthList){
+  const map = {};
+  (DATA.returns_by_sku || []).forEach(r => {
+    if (!monthList.includes(r.month)) return;
+    map[r.sku_group] = (map[r.sku_group] || 0) + (r.return_qty || 0);
+  });
+  return map;
+}
+
+// Shared pipeline for both tabs: aggregate -> sort desc by the chosen Rank/
+// Split-By metric -> cumulative value % and SKU-count % (rank position), plus
+// every derived field needed for the fixed column set (ASP, GM%, Discount, etc).
+function computeParetoRows(salesBySku, rankMetricKey, monthList){
+  const returnsMap = buildReturnsBySkuMap(monthList);
+  const rows = aggregateBySkuGroup(salesBySku, returnsMap);
+  rows.forEach(g => {
+    g.asp = g.qty > 0 ? (g.gross_sales / g.qty) : 0;
+    g.gm_pct = g.gross_sales > 0 ? ((g.gross_sales - g.cogs_sold) / g.gross_sales * 100) : null;
+    g.mrp_per_unit = g.qty > 0 ? (g.mrp_value / g.qty) : 0;
+    g.discount = g.mrp_value - g.gross_sales;
+    g.discount_pct = g.mrp_value > 0 ? (g.discount / g.mrp_value * 100) : null;
+    // Return/Net always shown in Gross-Sales (Rupee) terms. Exact only if the
+    // return_qty could be tied to a real return revenue figure, which the
+    // source table doesn't have -- so this is always an estimate (qty x ASP).
+    g.return_value = g.return_qty * g.asp;
+    g.net_value = g.gross_sales - g.return_value;
+    g.rank_value = g[rankMetricKey] ?? g.gross_sales;
+  });
+  rows.sort((a,b) => b.rank_value - a.rank_value);
+  const total = rows.reduce((s,r) => s + r.rank_value, 0);
+  const grossTotal = rows.reduce((s,r) => s + r.gross_sales, 0);
+  let cum = 0;
+  rows.forEach((r, i) => {
+    cum += r.rank_value;
+    r.cum_value = cum;
+    r.cum_pct = total > 0 ? (cum/total*100) : 0;
+    r.sku_count = i + 1;
+    r.count_pct = ((i+1)/rows.length*100);
+    r.quartile = r.cum_pct <= 25 ? 1 : r.cum_pct <= 50 ? 2 : r.cum_pct <= 75 ? 3 : 4;
+  });
+  return { rows, total, grossTotal };
+}
+
+function metricSelectHtml(idPrefix){
+  return `<div class="filter-group" style="min-width:200px;">
+    <label>Rank / Split By</label>
+    <select id="${idPrefix}-metric">
+      ${PARETO_METRICS.map(m => `<option value="${m.id}" ${m.id===paretoMetric?'selected':''}>${m.label}</option>`).join('')}
+    </select>
+  </div>`;
+}
+
+function sliderHtml(idPrefix, value){
+  return `<div class="filter-group" style="min-width:280px;">
+    <label>Show top <span id="${idPrefix}-slider-val">${value}</span>% of SKU count</label>
+    <input type="range" id="${idPrefix}-slider" min="1" max="100" value="${value}" style="width:100%; accent-color: var(--amber);">
+  </div>`;
+}
+
+function dateRangeHtml(idPrefix, startVal, endVal){
+  return `
+    <div class="filter-group"><label>From</label>
+      <input type="date" id="${idPrefix}-date-start" value="${startVal}" style="background:var(--panel-2); border:1px solid var(--line); color:var(--text); padding:8px 10px; border-radius:6px; font-family:'IBM Plex Mono', monospace; font-size:12px;">
+    </div>
+    <div class="filter-group"><label>To</label>
+      <input type="date" id="${idPrefix}-date-end" value="${endVal}" style="background:var(--panel-2); border:1px solid var(--line); color:var(--text); padding:8px 10px; border-radius:6px; font-family:'IBM Plex Mono', monospace; font-size:12px;">
+    </div>`;
+}
+
+function fmtVal(v, metricKey){
+  if (v === null || v === undefined) return '—';
+  return metricKey === 'qty' ? Math.round(v).toLocaleString() : ('\u20b9' + fmtNum(v));
+}
+function fmtPct(v){ return (v === null || v === undefined) ? '—' : v.toFixed(1)+'%'; }
+function fmtMoney(v){ return (v === null || v === undefined) ? '—' : ('\u20b9' + fmtNum(v)); }
+
+// Fixed, always-visible column set (per Aditya's spec) -- not driven by the
+// Rank/Split By selector, which only controls sort order / quartile basis now.
+function paretoColumns(){
+  return [
+    {key:'sku_group', label:'SKU Group', align:'left'},
+    {key:'l1', label:'L1', align:'left'},
+    {key:'cat', label:'Cat', align:'left'},
+    {key:'m1', label:'M1', align:'left'},
+    {key:'m2', label:'M2', align:'left'},
+    {key:'m3', label:'M3', align:'left'},
+    {key:'gross_sales', label:'Gross Sales', render:r => fmtMoney(r.gross_sales)},
+    {key:'count_pct', label:'SKU Count %', render:r => fmtPct(r.count_pct)},
+    {key:'qty', label:'Qty', render:r => Math.round(r.qty).toLocaleString()},
+    {key:'asp', label:'ASP', render:r => fmtMoney(r.asp)},
+    {key:'gm_pct', label:'GM%', render:r => fmtPct(r.gm_pct)},
+    {key:'mrp_per_unit', label:'MRP', render:r => fmtMoney(r.mrp_per_unit)},
+    {key:'mrp_value', label:'MRP Value', render:r => fmtMoney(r.mrp_value)},
+    {key:'discount', label:'Discount', render:r => fmtMoney(r.discount)},
+    {key:'discount_pct', label:'Discount %', render:r => fmtPct(r.discount_pct)},
+    {key:'return_value', label:'Returns (Est.)', render:r => fmtMoney(r.return_value)},
+    {key:'net_value', label:'Net', render:r => fmtMoney(r.net_value)},
+    {key:'image', label:'Image', sortable:false, render:r => skuThumb(r.sku_group)},
+  ];
+}
+
+function sortRowsForDisplay(rows, sort){
+  const copy = rows.slice();
+  copy.sort((a,b) => {
+    let va = a[sort.key], vb = b[sort.key];
+    if (typeof va === 'string' || typeof vb === 'string'){
+      va = (va ?? '').toString(); vb = (vb ?? '').toString();
+      return sort.dir === 'asc' ? va.localeCompare(vb) : vb.localeCompare(va);
+    }
+    va = va ?? 0; vb = vb ?? 0;
+    return sort.dir === 'asc' ? va - vb : vb - va;
+  });
+  return copy;
+}
+
+function renderSkuTable(rows, columns, sort, cardIdPrefix, extraRowClass){
+  const headerCells = columns.map(col => {
+    const sortable = col.sortable !== false;
+    const isActive = sort.key === col.key;
+    const arrow = isActive ? (sort.dir === 'asc' ? ' \u25b2' : ' \u25bc') : '';
+    return `<th ${col.align==='left' ? 'style="text-align:left;"' : ''} ${sortable ? `class="sortable-th" data-sort-card="${cardIdPrefix}" data-sort-key="${col.key}"` : ''}>${col.label}${arrow}</th>`;
+  }).join('');
+  const bodyRows = rows.map((r,i) => `<tr class="${extraRowClass ? extraRowClass(r,i) : ''}">
+    ${columns.map(col => `<td class="${col.align==='left' ? 'rowlabel' : ''}">${col.render ? col.render(r) : (r[col.key] ?? '\u2014')}</td>`).join('')}
+  </tr>`).join('');
+  return `<table class="ptable"><thead><tr>${headerCells}</tr></thead><tbody>${bodyRows}</tbody></table>`;
+}
+
+function attachSkuTableSortHandlers(container, cardIdPrefix, sortStateRef, onSortChange){
+  container.querySelectorAll(`.sortable-th[data-sort-card="${cardIdPrefix}"]`).forEach(th => {
+    th.addEventListener('click', () => {
+      const key = th.dataset.sortKey;
+      let dir = 'desc';
+      if (sortStateRef.key === key) dir = sortStateRef.dir === 'desc' ? 'asc' : 'desc';
+      onSortChange({key, dir});
+    });
+  });
+}
+
+function attachDateRangeHandlers(controls, idPrefix, getStart, getEnd, onChange){
+  controls.querySelector(`#${idPrefix}-date-start`).addEventListener('change', e => onChange(e.target.value, getEnd()));
+  controls.querySelector(`#${idPrefix}-date-end`).addEventListener('change', e => onChange(getStart(), e.target.value));
+}
+
+function renderParetoTab(salesBySku, f){
+  ensureParetoDateDefaults();
+  const root = document.getElementById('pareto-root');
+  root.innerHTML = '';
+
+  const controls = document.createElement('div');
+  controls.className = 'pareto-controls';
+  controls.innerHTML = metricSelectHtml('pareto') + dateRangeHtml('pareto', paretoDateStart, paretoDateEnd) + sliderHtml('pareto', paretoCountPctLimit);
+  root.appendChild(controls);
+  controls.querySelector('#pareto-metric').addEventListener('change', e => { paretoMetric = e.target.value; render(); });
+  attachDateRangeHandlers(controls, 'pareto', () => paretoDateStart, () => paretoDateEnd, (s,e) => { paretoDateStart = s; paretoDateEnd = e; render(); });
+  const slider = controls.querySelector('#pareto-slider');
+  slider.addEventListener('input', e => { controls.querySelector('#pareto-slider-val').textContent = e.target.value; });
+  slider.addEventListener('change', e => { paretoCountPctLimit = parseInt(e.target.value,10); render(); });
+
+  const months = monthsInRange(paretoDateStart, paretoDateEnd);
+  const scoped = salesBySku.filter(r => months.includes(r.month));
+  const { rows: allRows, grossTotal } = computeParetoRows(scoped, paretoMetric, months);
+  const rankLabel = PARETO_METRICS.find(m => m.id === paretoMetric).label;
+
+  if (allRows.length === 0){
+    const p = document.createElement('div');
+    p.className = 'empty-note';
+    p.textContent = 'No sku_group-level rows match the current filter/date range.';
+    root.appendChild(p);
+    return;
+  }
+
+  const crossIdx = allRows.findIndex(r => r.cum_pct >= 80);
+  const skusFor80 = crossIdx === -1 ? allRows.length : crossIdx + 1;
+  const pctSkusFor80 = (skusFor80 / allRows.length * 100);
+
+  const kpiRow = document.createElement('div');
+  kpiRow.className = 'kpi-row';
+  kpiRow.style.marginBottom = '26px';
+  kpiRow.innerHTML = `
+    <div class="kpi"><div class="label">Total SKU Groups</div><div class="value">${allRows.length}</div></div>
+    <div class="kpi"><div class="label">Total Gross Sales</div><div class="value">${fmtMoney(grossTotal)}</div></div>
+    <div class="kpi"><div class="label">SKUs Driving 80% (by ${rankLabel})</div><div class="value">${skusFor80}</div><div class="sub">${pctSkusFor80.toFixed(1)}% of SKU groups</div></div>
+    <div class="kpi"><div class="label">Top SKU Group</div><div class="value" style="font-size:15px;">${allRows[0].sku_group}</div><div class="sub">${fmtMoney(allRows[0].gross_sales)}</div></div>
+    <div class="kpi"><div class="label">Long Tail</div><div class="value">${allRows.length - skusFor80}</div><div class="sub">SKUs for the remaining 20%</div></div>
+  `;
+  root.appendChild(kpiRow);
+
+  const visibleRows = allRows.filter(r => r.count_pct <= paretoCountPctLimit);
+  const displayRows = sortRowsForDisplay(visibleRows, paretoSort);
+
+  const section = document.createElement('div');
+  section.className = 'card-section';
+  section.innerHTML = `<h2>Pareto \u2014 sku_group ranked by ${rankLabel} <span class="rule"></span><span class="count">${displayRows.length} of ${allRows.length} shown</span></h2>
+    <div class="empty-note">Range resolves to full months (${months.join(', ')}) -- data is monthly grain, not daily. SKU Count % denominator = all ${allRows.length} distinct SKU groups with sales in this range. Returns/Net are estimated (return qty \u00d7 that SKU's average ASP this period), not a directly sourced Rupee figure.</div>`;
+  const strip = document.createElement('div');
+  strip.className = 'pivot-strip';
+  const columns = paretoColumns();
+  strip.innerHTML = `<div class="pivot-block" style="min-width:100%;">${renderSkuTable(displayRows, columns, paretoSort, 'pareto', (r) => {
+    const originalIdx = allRows.indexOf(r);
+    return originalIdx === crossIdx ? 'pareto-line' : '';
+  })}</div>`;
+  section.appendChild(strip);
+  root.appendChild(section);
+
+  attachSkuTableSortHandlers(strip, 'pareto', paretoSort, (newSort) => { paretoSort = newSort; render(); });
+}
+
+function renderQuartileTab(salesBySku, f){
+  ensureParetoDateDefaults();
+  const root = document.getElementById('quartile-root');
+  root.innerHTML = '';
+
+  const controls = document.createElement('div');
+  controls.className = 'pareto-controls';
+  controls.innerHTML = metricSelectHtml('quartile') + dateRangeHtml('quartile', quartileDateStart, quartileDateEnd) + sliderHtml('quartile', quartileCountPctLimit);
+  root.appendChild(controls);
+  controls.querySelector('#quartile-metric').addEventListener('change', e => { paretoMetric = e.target.value; render(); });
+  attachDateRangeHandlers(controls, 'quartile', () => quartileDateStart, () => quartileDateEnd, (s,e) => { quartileDateStart = s; quartileDateEnd = e; render(); });
+  const slider = controls.querySelector('#quartile-slider');
+  slider.addEventListener('input', e => { controls.querySelector('#quartile-slider-val').textContent = e.target.value; });
+  slider.addEventListener('change', e => { quartileCountPctLimit = parseInt(e.target.value,10); render(); });
+
+  const months = monthsInRange(quartileDateStart, quartileDateEnd);
+  const scoped = salesBySku.filter(r => months.includes(r.month));
+  const { rows: allRows, grossTotal } = computeParetoRows(scoped, paretoMetric, months);
+  const rankLabel = PARETO_METRICS.find(m => m.id === paretoMetric).label;
+
+  if (allRows.length === 0){
+    const p = document.createElement('div');
+    p.className = 'empty-note';
+    p.textContent = 'No sku_group-level rows match the current filter/date range.';
+    root.appendChild(p);
+    return;
+  }
+
+  const QLABELS = {1:'Q1 \u2014 Top 25%', 2:'Q2 \u2014 25\u201350%', 3:'Q3 \u2014 50\u201375%', 4:'Q4 \u2014 Bottom 25%'};
+  const byQ = {1:[], 2:[], 3:[], 4:[]};
+  allRows.forEach(r => byQ[r.quartile].push(r));
+
+  const summary = document.createElement('div');
+  summary.className = 'quartile-summary';
+  summary.innerHTML = [1,2,3,4].map(q => {
+    const qrows = byQ[q];
+    const qGross = qrows.reduce((s,r) => s + r.gross_sales, 0);
+    const pctOfTotal = grossTotal > 0 ? (qGross/grossTotal*100) : 0;
+    return `<div class="q-card q${q}">
+      <div class="qlabel">${QLABELS[q]}</div>
+      <div class="qsub">${qrows.length} sku groups \u00b7 ${(qrows.length/allRows.length*100).toFixed(1)}% of count</div>
+      <div class="qval">${fmtMoney(qGross)}</div>
+      <div class="qmeta">${pctOfTotal.toFixed(1)}% of total Gross Sales (ranked by ${rankLabel})</div>
+    </div>`;
+  }).join('');
+  root.appendChild(summary);
+
+  const visibleRows = allRows.filter(r => r.count_pct <= quartileCountPctLimit);
+  const displayRows = sortRowsForDisplay(visibleRows, quartileSort);
+
+  const section = document.createElement('div');
+  section.className = 'card-section';
+  section.innerHTML = `<h2>Quartile \u2014 sku_group split by cumulative ${rankLabel} contribution <span class="rule"></span><span class="count">${displayRows.length} of ${allRows.length} shown</span></h2>
+    <div class="empty-note">Range resolves to full months (${months.join(', ')}) -- data is monthly grain, not daily. SKU Count % denominator = all ${allRows.length} distinct SKU groups with sales in this range. Returns/Net are estimated (return qty \u00d7 that SKU's average ASP this period), not a directly sourced Rupee figure.</div>`;
+  const strip = document.createElement('div');
+  strip.className = 'pivot-strip';
+  const baseColumns = paretoColumns();
+  const columns = [
+    ...baseColumns.slice(0, 6), // SKU Group..M3
+    {key:'quartile', label:'Quartile', render:r => `<span class="qtag q${r.quartile}">Q${r.quartile}</span>`},
+    ...baseColumns.slice(6), // Gross Sales..Image
+  ];
+  strip.innerHTML = `<div class="pivot-block" style="min-width:100%;">${renderSkuTable(displayRows, columns, quartileSort, 'quartile')}</div>`;
+  section.appendChild(strip);
+  root.appendChild(section);
+
+  attachSkuTableSortHandlers(strip, 'quartile', quartileSort, (newSort) => { quartileSort = newSort; render(); });
 }
 </script>
 

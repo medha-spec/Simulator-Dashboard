@@ -25,6 +25,13 @@ THREE ways to run this:
 
 Either way it writes data/data.json, which is the only thing index.html reads.
 
+Sales now comes from Snowflake (SALES_FOR_AUTO_2, daily grain), not the "Sales
+Data" Google Sheet tab. Requires these env vars (or a local
+snowflake_credentials.json -- see snowflake_credentials.example.json):
+  SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER, SNOWFLAKE_PASSWORD,
+  SNOWFLAKE_WAREHOUSE, SNOWFLAKE_DATABASE, SNOWFLAKE_SCHEMA
+Inventory and Pipeline still come from Google Sheets as before.
+
 Setup for mode A (one-time):
   pip install google-api-python-client google-auth --break-system-packages
   1. console.cloud.google.com -> new/existing project -> enable "Google Sheets API"
@@ -38,13 +45,22 @@ Setup for mode A (one-time):
 import json, datetime, sys, os, csv
 import openpyxl
 
+# Rolling window for Snowflake-sourced data (Sales, Returns actual, Sales-by-SKU).
+# Computed fresh every run from *today*, not a fixed date -- this is what keeps
+# sales.json/returns_actual.json/sales_by_sku.json from growing bigger every
+# single day forever. 400 days covers: current month, full prior-year MoM
+# comparison, and any reasonable Custom Range pick in the Analytics tab, while
+# old days automatically age out of the window as time moves forward.
+ROLLING_WINDOW_DAYS = 400
+ROLLING_CUTOFF_DATE = (datetime.date.today() - datetime.timedelta(days=ROLLING_WINDOW_DAYS)).isoformat()
+
 SHEET_ID = "1PqtpL9w2Tneon_-6zz7BGiW5YUz4fhDCrgn687r_CZw"
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOCAL_XLSX = os.path.join(HERE, "Automation_Data.xlsx")
 SERVICE_ACCOUNT_FILE = os.path.join(HERE, "service_account.json")
 TARGETS_DIR = os.path.join(HERE, "data", "targets")
 OUT = os.path.join(HERE, "data", "data.json")
-TAB_NAMES = ["Sales Data", "Inv Data 2", "Pipeline"]
+TAB_NAMES = ["Inv Data 2", "Pipeline"]  # Sales Data removed -- now sourced from Snowflake
 
 # Exact filenames expected in data/targets/ -- one per category family, each with
 # a "Sheet1" tab at store/branch grain with monthly qty columns (AUG_2026.. JUN_2027).
@@ -138,8 +154,8 @@ def fetch_via_sheets_api(sheet_id):
     values_api = service.spreadsheets().values()
 
     # date columns (0-indexed) per tab, so serials get converted correctly
-    date_cols = {"Sales Data": (0,), "Inv Data 2": (0,), "Pipeline": (0, 1, 20, 21)}
-    widths = {"Sales Data": 15, "Inv Data 2": 17, "Pipeline": 28}
+    date_cols = {"Inv Data 2": (0,), "Pipeline": (0, 1, 20, 21)}
+    widths = {"Inv Data 2": 17, "Pipeline": 28}
 
     sheets = {}
     for tab in TAB_NAMES:
@@ -165,6 +181,371 @@ def download_from_gsheet(sheet_id, dest):
     with open(dest, "wb") as f:
         f.write(r.content)
     print(f"Saved -> {dest}")
+
+
+# ---------------------------------------------------------------------------
+# Snowflake: daily-grain Sales (SALES_FOR_AUTO_2), replaces the "Sales Data"
+# Google Sheet tab. Credentials come from env vars so the same code works
+# locally (via snowflake_credentials.json, loaded into env vars below) and
+# in GitHub Actions (via repo secrets injected as env vars in the workflow).
+# ---------------------------------------------------------------------------
+SNOWFLAKE_CREDS_FILE = os.path.join(HERE, "snowflake_credentials.json")
+
+SNOWFLAKE_QUERY = f"""
+    SELECT DATE, CHANNEL, L1_CATEGORY, CATEGORY, META1, META2, META3,
+           SUM(GROSS_SALES_VALUE) AS GROSS_SALES_VALUE, SUM(MRP_VALUE) AS MRP_VALUE,
+           SUM(QTY) AS QTY, SUM(COGS_SOLD) AS COGS_SOLD
+    FROM SNITCH_DB.MAPLEMONK.SALES_FOR_AUTO_3
+    WHERE DATE >= '{ROLLING_CUTOFF_DATE}'
+    GROUP BY DATE, CHANNEL, L1_CATEGORY, CATEGORY, META1, META2, META3
+"""
+
+# Separate, much smaller SKU-level dataset for the Pareto/Quartile tabs only --
+# aggregated by MONTH (not by day), since those tabs only need period totals
+# per sku_group, not daily granularity. Keeping this out of the main SNOWFLAKE_QUERY
+# above is what keeps data.json from ballooning to 1GB+ (SALES_FOR_AUTO_3 is raw
+# SKU-day grain; exploding that into the main sales array multiplies file size
+# by roughly the average SKU count per leaf combo).
+SALES_BY_SKU_QUERY = f"""
+    SELECT
+        TO_CHAR(DATE, 'YYYY-MM') AS MONTH, CHANNEL, SKU_GROUP,
+        L1_CATEGORY, CATEGORY, META1, META2, META3,
+        SUM(GROSS_SALES_VALUE) AS GROSS_SALES_VALUE, SUM(QTY) AS QTY,
+        SUM(COGS_SOLD) AS COGS_SOLD, SUM(MRP_VALUE) AS MRP_VALUE
+    FROM SNITCH_DB.MAPLEMONK.SALES_FOR_AUTO_3
+    WHERE DATE >= '{ROLLING_CUTOFF_DATE}'
+    GROUP BY TO_CHAR(DATE, 'YYYY-MM'), CHANNEL, SKU_GROUP, L1_CATEGORY, CATEGORY, META1, META2, META3
+"""
+# NOTE: this now uses the same rolling ROLLING_CUTOFF_DATE as the main sales
+# query (computed fresh from today's date every run -- see top of file), not a
+# fixed date. That's what keeps this file's size roughly constant over time
+# instead of growing forever as more months of history accumulate.
+
+# Returns at the same monthly SKU_GROUP grain as SALES_BY_SKU_QUERY, for the
+# Pareto/Quartile "Return" and "Net Value" columns. Joined directly on raw
+# SKU_GROUP (NOT the parent-cleaned version used in the main RETURNS_QUERY) --
+# RETURNS_DATA and SALES_FOR_AUTO_3 both come from the same order-line SKU
+# identifiers, so they should match exactly without needing the meta_mapping
+# product-master join at all here. Only OVERALL_RETURNS_QTY exists (no return
+# *value* field in the source table) -- return value in Rupee-metric terms is
+# therefore an ESTIMATE (return_qty x that SKU-month's average per-unit rate),
+# clearly labeled "Est." in the UI. Qty-based return counts are exact.
+RETURNS_BY_SKU_QUERY = f"""
+    SELECT
+        TO_CHAR(DATE, 'YYYY-MM') AS MONTH, SKU_GROUP,
+        SUM(OVERALL_RETURNS_QTY) AS RETURN_QTY
+    FROM SNITCH_DB.MAPLEMONK.RETURNS_DATA
+    WHERE DATE >= '{ROLLING_CUTOFF_DATE}'
+    GROUP BY TO_CHAR(DATE, 'YYYY-MM'), SKU_GROUP
+"""
+
+# ---------------------------------------------------------------------------
+# Snowflake: one representative image URL per sku_group, for the Pareto /
+# Quartile tabs (thumbnail next to each ranked SKU group). Picks the first
+# IMAGE-type media (by media index) per sku_group across all its variants.
+# ---------------------------------------------------------------------------
+IMAGES_QUERY = r"""
+WITH images AS (
+    SELECT
+        UPPER(
+    TRIM(
+        CASE
+            WHEN variant.value:sku::STRING ILIKE '4C%'
+              OR variant.value:sku::STRING ILIKE 'MP%'
+            THEN REGEXP_SUBSTR(variant.value:sku::STRING, '^[^-]+-[^-]+-[^-]+')
+            ELSE REGEXP_SUBSTR(variant.value:sku::STRING, '^[^-]+-[^-]+')
+        END
+    )
+) AS sku_group,
+        image.value:preview:image:url::STRING AS image_url,
+        image.index AS image_index
+    FROM snitch_db.maplemonk.new_meafields_product_products_graph_ql t,
+         LATERAL FLATTEN(input => PARSE_JSON(t.media)) AS image,
+         LATERAL FLATTEN(input => PARSE_JSON(t.variants)) AS variant
+    WHERE image.value:mediaContentType::STRING = 'IMAGE'
+)
+SELECT
+    sku_group,
+    image_url
+FROM images
+QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY sku_group
+    ORDER BY image_index
+) = 1
+"""
+
+
+def _load_snowflake_creds():
+    """Local dev convenience: if snowflake_credentials.json exists, load its
+    keys into os.environ (only if not already set). In GitHub Actions, the
+    env vars are set directly by the workflow from repo secrets instead, so
+    this file is never needed/present there."""
+    if os.path.exists(SNOWFLAKE_CREDS_FILE):
+        with open(SNOWFLAKE_CREDS_FILE) as f:
+            creds = json.load(f)
+        for k, v in creds.items():
+            os.environ.setdefault(k, v)
+
+
+def _snowflake_connect():
+    import platform
+    platform.libc_ver = lambda *a, **k: ('', '')  # Windows Store python.exe workaround
+    import snowflake.connector
+
+    _load_snowflake_creds()
+    required = ["SNOWFLAKE_ACCOUNT", "SNOWFLAKE_USER", "SNOWFLAKE_PASSWORD",
+                "SNOWFLAKE_WAREHOUSE", "SNOWFLAKE_DATABASE", "SNOWFLAKE_SCHEMA"]
+    missing = [k for k in required if not os.environ.get(k)]
+    if missing:
+        print(f"ERROR: missing Snowflake env vars: {', '.join(missing)}")
+        print("Locally: create snowflake_credentials.json (see README/chat). In GitHub")
+        print("Actions: set these as repo secrets and pass them into the workflow env.")
+        sys.exit(1)
+
+    print("Connecting to Snowflake...")
+    return snowflake.connector.connect(
+        account=os.environ["SNOWFLAKE_ACCOUNT"],
+        user=os.environ["SNOWFLAKE_USER"],
+        password=os.environ["SNOWFLAKE_PASSWORD"],
+        warehouse=os.environ["SNOWFLAKE_WAREHOUSE"],
+        database=os.environ["SNOWFLAKE_DATABASE"],
+        schema=os.environ["SNOWFLAKE_SCHEMA"],
+    )
+
+
+def fetch_sales_from_snowflake():
+    conn = _snowflake_connect()
+    try:
+        cur = conn.cursor()
+        print("Fetching sales from SALES_FOR_AUTO_3 (aggregated to leaf grain)...")
+        cur.execute(SNOWFLAKE_QUERY)
+        rows = cur.fetchall()
+        cur.close()
+    finally:
+        conn.close()
+
+    sales = []
+    for row in rows:
+        (dt, channel, l1, cat, m1, m2, m3, gross_sales, mrp_value, qty, cogs_sold) = row
+        d = dt.strftime("%Y-%m-%d") if hasattr(dt, "strftime") else str(dt)[:10]
+        sales.append({
+            "date": d, "month": month_key(dt), "channel": channel, "l1": l1, "cat": cat,
+            "m1": m1, "m2": m2, "m3": m3,
+            "gross_sales": float(gross_sales or 0), "mrp_value": float(mrp_value or 0),
+            "qty": float(qty or 0), "cogs_sold": float(cogs_sold or 0),
+        })
+    print(f"  -> {len(sales)} sales rows from Snowflake")
+    return sales
+
+
+def fetch_sales_by_sku_from_snowflake():
+    """Separate, monthly-grain SKU-level dataset for Pareto/Quartile tabs only.
+    Kept out of the main sales array (see SALES_BY_SKU_QUERY comment) to avoid
+    the data.json size blowup."""
+    conn = _snowflake_connect()
+    try:
+        cur = conn.cursor()
+        print("Fetching sales_by_sku (monthly grain) from SALES_FOR_AUTO_3...")
+        cur.execute(SALES_BY_SKU_QUERY)
+        rows = cur.fetchall()
+        cur.close()
+    finally:
+        conn.close()
+
+    sales_by_sku = []
+    for row in rows:
+        (month, channel, sku_group, l1, cat, m1, m2, m3, gross_sales, qty, cogs_sold, mrp_value) = row
+        sales_by_sku.append({
+            "month": month, "channel": channel, "sku_group": sku_group,
+            "l1": l1, "cat": cat, "m1": m1, "m2": m2, "m3": m3,
+            "gross_sales": float(gross_sales or 0), "qty": float(qty or 0),
+            "cogs_sold": float(cogs_sold or 0), "mrp_value": float(mrp_value or 0),
+        })
+    print(f"  -> {len(sales_by_sku)} sales_by_sku rows from Snowflake")
+    return sales_by_sku
+
+
+def fetch_returns_by_sku_from_snowflake():
+    """Monthly-grain per-SKU returns, for the Pareto/Quartile 'Return' and 'Net
+    Value' columns. See RETURNS_BY_SKU_QUERY comment for the value-estimation
+    caveat (qty is exact, Rupee value is derived client-side as an estimate)."""
+    conn = _snowflake_connect()
+    try:
+        cur = conn.cursor()
+        print("Fetching returns_by_sku (monthly grain) from RETURNS_DATA...")
+        cur.execute(RETURNS_BY_SKU_QUERY)
+        rows = cur.fetchall()
+        cur.close()
+    finally:
+        conn.close()
+
+    returns_by_sku = []
+    for row in rows:
+        month, sku_group, return_qty = row
+        if not sku_group:
+            continue
+        returns_by_sku.append({"month": month, "sku_group": sku_group, "return_qty": float(return_qty or 0)})
+    print(f"  -> {len(returns_by_sku)} returns_by_sku rows from Snowflake")
+    return returns_by_sku
+
+
+def fetch_images_from_snowflake():
+    """One image URL per sku_group -> dict, for O(1) lookup client-side
+    (Pareto/Quartile tab thumbnails). Empty dict (not an error) if the query
+    returns nothing, so the tabs still render without images."""
+    conn = _snowflake_connect()
+    try:
+        cur = conn.cursor()
+        print("Fetching sku_group -> image_url map...")
+        cur.execute(IMAGES_QUERY)
+        rows = cur.fetchall()
+        cur.close()
+    finally:
+        conn.close()
+
+    images = {}
+    for sku_group, image_url in rows:
+        if sku_group and image_url:
+            images[sku_group] = image_url
+    print(f"  -> {len(images)} sku_group images from Snowflake")
+    return images
+
+
+# ---------------------------------------------------------------------------
+# Snowflake: daily-grain actual Returns (RETURNS_DATA), joined to the product
+# master (meta_mapping_cogs_sku) to get L1/Category/Meta1/2/3 per SKU_GROUP,
+# for the new Analytics tab's "Returns" metric (actual, not the learned/frozen
+# % used by the existing Returns tab).
+#
+# Channel split: RETURNS_DATA only has OVERALL_RETURNS_QTY and
+# SHOPIFY_RETURNS_QTY (no separate Marketplace/Offline columns). Per Aditya:
+# Offline returns are always 0, so:
+#   shopify_returns_qty    = SHOPIFY_RETURNS_QTY (exact)
+#   offline_returns_qty    = 0 (fixed)
+#   marketplace_returns_qty = OVERALL_RETURNS_QTY - SHOPIFY_RETURNS_QTY (exact,
+#                             since Offline contributes nothing to the gap)
+# One row per (date, sku_group) -- exploded into per-channel qty here, at the
+# SAME leaf grain (l1/cat/m1/m2/m3) as Sales, so it can be sliced identically.
+# ---------------------------------------------------------------------------
+RETURNS_QUERY = rf"""
+WITH meta_map AS (
+    SELECT
+        UPPER(
+            IFF(
+                UPPER(REPLACE(a.SKU_GROUP, ' ', '')) LIKE 'MP%'
+                OR UPPER(REPLACE(a.SKU_GROUP, ' ', '')) LIKE '4C-%',
+                REGEXP_REPLACE(REPLACE(a.SKU_GROUP, ' ', ''), '^([^-]+-[^-]+).*$', '\1'),
+                REGEXP_REPLACE(REPLACE(a.SKU_GROUP, ' ', ''), '-.*$', '')
+            )
+        ) AS sku_group_clean,
+        COALESCE(
+            MIN(CASE WHEN UPPER(TRIM(a.l1_category)) = 'LONG TAIL' THEN a.l1_category END),
+            MIN(CASE WHEN UPPER(TRIM(a.l1_category)) = 'PLUS' THEN a.l1_category END),
+            MIN(CASE WHEN UPPER(TRIM(a.l1_category)) = 'LUXE' THEN a.l1_category END),
+            MIN(CASE WHEN UPPER(TRIM(a.l1_category)) = 'SNITCH' THEN a.l1_category END),
+            MIN(a.l1_category)
+        ) AS l1_category,
+        COALESCE(
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'SHIRTS' THEN a.category END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'TSHIRTS' THEN a.category END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'JEANS' THEN a.category END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'TROUSERS' THEN a.category END),
+            MIN(a.category)
+        ) AS category,
+        COALESCE(
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'SHIRTS' THEN a.meta1 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'TSHIRTS' THEN a.meta1 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'JEANS' THEN a.meta1 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'TROUSERS' THEN a.meta1 END),
+            MIN(a.meta1)
+        ) AS meta1,
+        COALESCE(
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'SHIRTS' THEN a.meta2 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'TSHIRTS' THEN a.meta2 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'JEANS' THEN a.meta2 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'TROUSERS' THEN a.meta2 END),
+            MIN(a.meta2)
+        ) AS meta2,
+        COALESCE(
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'SHIRTS' THEN a.meta3 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'TSHIRTS' THEN a.meta3 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'JEANS' THEN a.meta3 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'TROUSERS' THEN a.meta3 END),
+            MIN(a.meta3)
+        ) AS meta3,
+        MAX(a.cogs) AS cogs
+    FROM snitch_db.maplemonk.meta_mapping_cogs_sku a
+    GROUP BY 1
+),
+returns_with_parent AS (
+    SELECT
+        r.*,
+        UPPER(
+            IFF(
+                UPPER(REPLACE(r.SKU_GROUP, ' ', '')) LIKE 'MP%'
+                OR UPPER(REPLACE(r.SKU_GROUP, ' ', '')) LIKE '4C-%',
+                REGEXP_REPLACE(REPLACE(r.SKU_GROUP, ' ', ''), '^([^-]+-[^-]+).*$', '\1'),
+                REGEXP_REPLACE(REPLACE(r.SKU_GROUP, ' ', ''), '-.*$', '')
+            )
+        ) AS sku_group_clean
+    FROM SNITCH_DB.MAPLEMONK.RETURNS_DATA r
+    WHERE r.DATE >= '{ROLLING_CUTOFF_DATE}'
+)
+SELECT
+    r.DATE,
+    m.l1_category, m.category, m.meta1, m.meta2, m.meta3,
+    SUM(r.SHOPIFY_REVENUE) AS SHOPIFY_REVENUE, SUM(r.SHOPIFY_QTY) AS SHOPIFY_QTY,
+    SUM(r.MP_REVENUE) AS MP_REVENUE, SUM(r.MP_QTY) AS MP_QTY,
+    SUM(r.OFFLINE_REVENUE) AS OFFLINE_REVENUE, SUM(r.OFFLINE_QTY) AS OFFLINE_QTY,
+    SUM(r.OVERALL_RETURNS_QTY) AS OVERALL_RETURNS_QTY, SUM(r.SHOPIFY_RETURNS_QTY) AS SHOPIFY_RETURNS_QTY
+FROM returns_with_parent r
+LEFT JOIN meta_map m
+    ON r.sku_group_clean = m.sku_group_clean
+GROUP BY r.DATE, m.l1_category, m.category, m.meta1, m.meta2, m.meta3
+"""
+
+
+def fetch_returns_from_snowflake():
+    conn = _snowflake_connect()
+    try:
+        cur = conn.cursor()
+        print("Fetching returns from RETURNS_DATA (joined to meta_mapping_cogs_sku)...")
+        cur.execute(RETURNS_QUERY)
+        rows = cur.fetchall()
+        cur.close()
+    finally:
+        conn.close()
+
+    returns_actual = []
+    unmapped = 0
+    for row in rows:
+        (dt, l1, cat, m1, m2, m3,
+         shopify_rev, shopify_qty, mp_rev, mp_qty, offline_rev, offline_qty,
+         overall_returns_qty, shopify_returns_qty) = row
+        if l1 is None or cat is None:
+            unmapped += 1
+            continue
+        d = dt.strftime("%Y-%m-%d") if hasattr(dt, "strftime") else str(dt)[:10]
+        overall_ret = float(overall_returns_qty or 0)
+        shopify_ret = float(shopify_returns_qty or 0)
+        mp_ret = max(0.0, overall_ret - shopify_ret)  # offline always 0, per Aditya
+        base = {"date": d, "month": month_key(dt), "l1": l1, "cat": cat, "m1": m1, "m2": m2, "m3": m3}
+        if float(shopify_qty or 0) or shopify_ret:
+            returns_actual.append({**base, "channel": "Shopify",
+                                    "sales_qty": float(shopify_qty or 0), "sales_value": float(shopify_rev or 0),
+                                    "return_qty": shopify_ret})
+        if float(mp_qty or 0) or mp_ret:
+            returns_actual.append({**base, "channel": "Marketplace",
+                                    "sales_qty": float(mp_qty or 0), "sales_value": float(mp_rev or 0),
+                                    "return_qty": mp_ret})
+        if float(offline_qty or 0):
+            returns_actual.append({**base, "channel": "Offline",
+                                    "sales_qty": float(offline_qty or 0), "sales_value": float(offline_rev or 0),
+                                    "return_qty": 0.0})
+    if unmapped:
+        print(f"  NOTE: {unmapped} rows had no L1/Category match in meta_mapping_cogs_sku, skipped.")
+    print(f"  -> {len(returns_actual)} returns rows (per-channel) from Snowflake")
+    return returns_actual
 
 
 def month_key(dt):
@@ -311,19 +692,12 @@ def build(xlsx_path_or_workbook):
     else:
         wb = xlsx_path_or_workbook  # already a loaded workbook (or SimpleWorkbook from the API path)
 
-    # ---- Sales ----
-    ws = wb["Sales Data"]
-    sales = []
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        if row[0] is None:
-            continue
-        month, channel, l1, cat, m1, m2, m3, cogs, mrp, gross_sales, mrp_value, qty, cogs_sold = row[:13]
-        sales.append({
-            "month": month_key(month), "channel": channel, "l1": l1, "cat": cat,
-            "m1": m1, "m2": m2, "m3": m3,
-            "gross_sales": gross_sales or 0, "mrp_value": mrp_value or 0,
-            "qty": qty or 0, "cogs_sold": cogs_sold or 0
-        })
+    # ---- Sales (now from Snowflake, daily grain -- see fetch_sales_from_snowflake) ----
+    sales = fetch_sales_from_snowflake()
+    sales_by_sku = fetch_sales_by_sku_from_snowflake()
+    returns_by_sku = fetch_returns_by_sku_from_snowflake()
+    returns_actual = fetch_returns_from_snowflake()
+    images = fetch_images_from_snowflake()
 
     # ---- Inventory ----
     # Kept at DAILY grain (not summed to month) because Closing(month) = the
@@ -382,26 +756,56 @@ def build(xlsx_path_or_workbook):
     else:
         print("NOTE: data/targets_og_fallback.json not found -- no fallback for uncovered categories.")
 
-    data = {
-        "generated_at": datetime.datetime.now().isoformat(),
-        "sales": sales,
-        "inventory": inventory,
-        "pipeline": pipeline,
-        "targets": targets,        # primary source: the 4 category files, multi-channel
-        "targets_og": targets_og,  # fallback: old Targets tab, Shopify-only, all categories
-        "returns": returns,        # frozen monthly learning rows: Channel x L1 x Cat x Month (2026), sales_qty/return_qty
+    data_dir = os.path.dirname(OUT)
+    os.makedirs(data_dir, exist_ok=True)
+
+    # Split across multiple files instead of one giant data.json:
+    #   1. GitHub hard-blocks any single file over 100MB -- one big file was
+    #      already past that (225MB+) and would fail to push outright.
+    #   2. The browser can fetch these in parallel and start rendering the
+    #      Dashboard as soon as sales/inventory/meta arrive, without waiting
+    #      on the (much larger) returns_actual/sales_by_sku to finish parsing.
+    parts = {
+        "meta.json": {
+            "generated_at": datetime.datetime.now().isoformat(),
+            "images": images,
+        },
+        "sales.json": {"sales": sales},
+        "sales_by_sku.json": {"sales_by_sku": sales_by_sku, "returns_by_sku": returns_by_sku},
+        "inventory.json": {"inventory": inventory},
+        "pipeline.json": {"pipeline": pipeline},
+        "returns_actual.json": {"returns_actual": returns_actual},
+        "targets.json": {
+            "targets": targets,        # primary source: the 4 category files, multi-channel
+            "targets_og": targets_og,  # fallback: old Targets tab, Shopify-only, all categories
+            "returns": returns,        # frozen monthly learning rows: Channel x L1 x Cat x Month (2026)
+        },
     }
-    os.makedirs(os.path.dirname(OUT), exist_ok=True)
-    with open(OUT, "w") as f:
-        json.dump(data, f)
-    print(f"sales rows: {len(sales)}, inventory rows: {len(inventory)}, pipeline rows: {len(pipeline)}, "
-          f"target rows (new files): {len(targets)}, target rows (OG fallback): {len(targets_og)}")
+    written = []
+    for filename, payload in parts.items():
+        path = os.path.join(data_dir, filename)
+        with open(path, "w") as f:
+            json.dump(payload, f)
+        size_mb = os.path.getsize(path) / (1024*1024)
+        written.append((filename, size_mb))
+
+    print(f"sales rows: {len(sales)}, sales_by_sku rows: {len(sales_by_sku)}, returns_by_sku rows: {len(returns_by_sku)}, "
+          f"inventory rows: {len(inventory)}, pipeline rows: {len(pipeline)}, "
+          f"target rows (new files): {len(targets)}, target rows (OG fallback): {len(targets_og)}, "
+          f"returns_actual rows: {len(returns_actual)}, images: {len(images)}")
     if len(sales) > 0 and len(inventory) == 0:
         print("\n⚠️  WARNING: Sales has rows but Inventory is empty. This is the exact symptom")
         print("   of an unauthenticated download failing to resolve IMPORTRANGE on Inv Data 2.")
         print("   Fix: re-download Automation_Data.xlsx manually via your browser (File > Download")
         print("   > Microsoft Excel), then re-run with --local. See the module docstring for detail.\n")
-    print(f"Wrote -> {OUT}")
+
+    print("\nWrote data files:")
+    total_mb = 0
+    for filename, size_mb in written:
+        flag = "  ⚠️ still >90MB, close to GitHub's 100MB limit!" if size_mb > 90 else ""
+        print(f"  data/{filename}: {size_mb:.1f} MB{flag}")
+        total_mb += size_mb
+    print(f"  TOTAL: {total_mb:.1f} MB across {len(written)} files -> {data_dir}")
 
 
 if __name__ == "__main__":
