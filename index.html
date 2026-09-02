@@ -47,7 +47,8 @@
 
   main{ padding:24px 32px 60px; max-width:1800px; margin:0 auto; }
 
-  .kpi-row{ display:grid; grid-template-columns:repeat(5, 1fr); gap:12px; margin-bottom:30px; }
+  .kpi-row{ display:grid; grid-template-columns:repeat(6, 1fr); gap:12px; margin-bottom:30px; }
+  @media(max-width:1200px){ .kpi-row{ grid-template-columns:repeat(3,1fr);} }
   @media(max-width:1000px){ .kpi-row{ grid-template-columns:repeat(2,1fr);} }
   .kpi{ background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; position:relative; overflow:hidden; }
   .kpi::before{ content:''; position:absolute; left:0; top:0; bottom:0; width:3px; background:var(--amber-dim); }
@@ -104,6 +105,10 @@
   .sku-thumb{ width:94px; height:94px; border-radius:8px; object-fit:cover; background:var(--panel-2); border:1px solid var(--line); vertical-align:middle; cursor:zoom-in; transition:transform 0.15s; }
   .sku-thumb:hover{ transform:scale(1.05); border-color:var(--amber); }
   .sku-thumb-placeholder{ width:94px; height:94px; border-radius:8px; background:var(--panel-2); border:1px solid var(--line); display:inline-block; vertical-align:middle; }
+  .sku-thumb-lg{ width:150px; height:150px; }
+  .sku-thumb-placeholder-lg{ width:150px; height:150px; }
+
+  .clicks-chart-wrap{ padding:8px 6px 0; margin:0 auto; }
   .img-lightbox{ display:none; position:fixed; inset:0; background:rgba(10,12,10,0.92); z-index:1000; align-items:center; justify-content:center; cursor:zoom-out; }
   .img-lightbox.open{ display:flex; }
   .img-lightbox img{ max-width:90vw; max-height:90vh; border-radius:10px; border:1px solid var(--line); box-shadow:0 20px 60px rgba(0,0,0,0.5); }
@@ -170,6 +175,8 @@
     <button data-page="analytics">ANALYTICS</button>
     <button data-page="pareto">PARETO</button>
     <button data-page="quartile">QUARTILE</button>
+    <button data-page="livesku">LIVE SKU GROUPS</button>
+    <button data-page="clicks">CLICKS</button>
   </div>
   <div class="active-path" id="active-path"></div>
 </div>
@@ -196,6 +203,12 @@
   </div>
   <div id="page-quartile" style="display:none;">
     <div id="quartile-root"></div>
+  </div>
+  <div id="page-livesku" style="display:none;">
+    <div id="livesku-root"></div>
+  </div>
+  <div id="page-clicks" style="display:none;">
+    <div id="clicks-root"></div>
   </div>
 </main>
 
@@ -251,7 +264,8 @@ function currentMonthKey(){
 
 const DATA_PARTS = [
   'data/meta.json', 'data/sales.json', 'data/sales_by_sku.json',
-  'data/inventory.json', 'data/pipeline.json', 'data/returns_actual.json', 'data/targets.json'
+  'data/inventory.json', 'data/pipeline.json', 'data/returns_actual.json', 'data/targets.json',
+  'data/livesku.json', 'data/clicks.json'
 ];
 
 Promise.all(DATA_PARTS.map(url => fetch(url).then(r => {
@@ -423,6 +437,8 @@ function populateFilters(){
       document.getElementById('page-analytics').style.display = currentPage === 'analytics' ? '' : 'none';
       document.getElementById('page-pareto').style.display = currentPage === 'pareto' ? '' : 'none';
       document.getElementById('page-quartile').style.display = currentPage === 'quartile' ? '' : 'none';
+      document.getElementById('page-livesku').style.display = currentPage === 'livesku' ? '' : 'none';
+      document.getElementById('page-clicks').style.display = currentPage === 'clicks' ? '' : 'none';
       render();
     });
   });
@@ -534,9 +550,8 @@ function targetLCFromOG(l1, cat, month){
   return sum;
 }
 function targetLC(channelFilter, l1, cat, month){
-  if (NEW_FILE_CATS.has(cat)){
-    return targetLCFromNewSource(channelFilter, l1, cat, month);
-  }
+  const fromNew = targetLCFromNewSource(channelFilter, l1, cat, month);
+  if (fromNew !== null) return fromNew;
   if (channelFilter === 'ALL' || channelFilter === 'Shopify'){
     return targetLCFromOG(l1, cat, month);
   }
@@ -636,6 +651,15 @@ function render(){
     return recs.length && leafMatches(recs[0], f);
   });
 
+  if (currentPage === 'livesku'){
+    renderLiveSkuKPIs(f);
+    renderLiveSkuTab(f);
+    return;
+  }
+  if (currentPage === 'clicks'){
+    renderClicksTab(f);
+    return;
+  }
   renderKPIs(sales, leafKeysMatchingFilter, qtyField, valField, f);
   if (currentPage === 'dashboard'){
     renderCards(sales, leafKeysMatchingFilter, f, qtyField, valField);
@@ -651,9 +675,342 @@ function render(){
   } else if (currentPage === 'quartile'){
     const salesBySku = (DATA.sales_by_sku || []).filter(r => salesMatches(r, f));
     renderQuartileTab(salesBySku, f);
-  } else {
+  } else if (currentPage === 'returns'){
     renderReturnsTab();
   }
+}
+
+// SKU groups excluded from every Live SKU Groups KPI/table, per instruction:
+//  - no L1 category, or L1 = "Long Tail" (not a real launch cohort)
+//  - SKU_GROUP prefixed MP-, FK-, PP, or B2B (marketplace/private-label/B2B
+//    listings, not regular launches). PP and B2B don't always carry a dash
+//    right after the prefix (e.g. "PP12-...", "B2BST001-01"), so those two
+//    are matched as plain prefixes rather than requiring "PP-"/"B2B-".
+//  - SKU_CLASS = 'MP' (same reason, belt-and-suspenders on the class column)
+function liveSkuExcluded(r){
+  // normalize underscores to spaces -- source data spells it "long_tail", not "Long Tail"
+  const l1 = (r.l1 || '').trim().toUpperCase().replace(/_/g, ' ');
+  if (l1 === '' || l1 === 'LONG TAIL') return true;
+  const sku = (r.sku_group || '').toUpperCase();
+  if (sku.startsWith('MP-') || sku.startsWith('FK-') || sku.startsWith('PP') || sku.startsWith('B2B')) return true;
+  if ((r.sku_class || '').toUpperCase() === 'MP') return true;
+  return false;
+}
+function liveSkuMatchesFilter(r, f){
+  if (f.l1 !== 'ALL' && r.l1 !== f.l1) return false;
+  if (f.cat !== 'ALL' && r.cat !== f.cat) return false;
+  if (f.m1 !== 'ALL' && r.m1 !== f.m1) return false;
+  if (f.m2 !== 'ALL' && r.m2 !== f.m2) return false;
+  if (f.m3 !== 'ALL' && r.m3 !== f.m3) return false;
+  return true; // Channel intentionally ignored -- this dataset isn't channel-scoped
+}
+
+// Live SKU Groups + Clicks tabs display dates as DD-MM-YYYY, not the raw
+// YYYY-MM-DD the data arrives in.
+function fmtDMY(dateStr){
+  if (!dateStr) return null;
+  const [y, m, d] = dateStr.split('-');
+  return `${d}-${m}-${y}`;
+}
+
+// Shared "top 10, expand for the rest" table used by both the Live SKU
+// Groups and Clicks tabs, so long SKU-group lists don't dump hundreds of
+// rows on screen by default.
+function toggleTableRows(id, btn, total){
+  const extra = document.getElementById(id);
+  const showing = extra.style.display !== 'none';
+  extra.style.display = showing ? 'none' : '';
+  btn.textContent = showing ? `Show all ${total} ▾` : 'Show top 10 only ▴';
+}
+function buildCollapsibleTable(id, headerHTML, rowsList, rowRenderFn, emptyMsg){
+  if (!rowsList.length) return `<div class="empty-note">${emptyMsg || 'No rows.'}</div>`;
+  const top10 = rowsList.slice(0, 10);
+  const rest = rowsList.slice(10);
+  const extraId = `extra-${id}`;
+  const table = `
+    <div style="overflow-x:auto;">
+      <table class="ptable">
+        <thead><tr>${headerHTML}</tr></thead>
+        <tbody>${top10.map(rowRenderFn).join('')}</tbody>
+        <tbody id="${extraId}" style="display:none;">${rest.map(rowRenderFn).join('')}</tbody>
+      </table>
+    </div>`;
+  const button = rest.length
+    ? `<button class="reset-btn" style="margin-top:10px;" onclick="toggleTableRows('${extraId}', this, ${rowsList.length})">Show all ${rowsList.length} ▾</button>`
+    : '';
+  return table + button;
+}
+
+// r.delay is now DATEDIFF(putaway date, FINAL_LIVE_DATE) -- i.e. time-to-live,
+// null for every not-live row (no live date yet). "Days since inward" (needed
+// for the 60-day lot and the not-live delay buckets) is a different question,
+// so it's derived here from r.date instead, independent of that field.
+function daysSincePutaway(dateStr){
+  if (!dateStr) return null;
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const then = Date.UTC(y, m - 1, d);
+  const now = new Date();
+  const today = Date.UTC(now.getFullYear(), now.getMonth(), now.getDate());
+  return Math.round((today - then) / 86400000);
+}
+
+// Single source of truth for the funnel, shared by the KPI row and the two
+// reason/delay breakdown tables below it -- keeps them always in sync.
+function computeLiveSkuFunnel(f){
+  const rows = (DATA.live_sku_groups || []).filter(r => liveSkuMatchesFilter(r, f) && !liveSkuExcluded(r));
+  const liveRows = rows.filter(r => r.live_date && (r.today_wh_qty || 0) > 5);
+  const last60Rows = rows.filter(r => {
+    const pending = daysSincePutaway(r.date);
+    return pending !== null && pending < 60 && (r.today_wh_qty || 0) > 5;
+  });
+  const notLiveRows = last60Rows.filter(r => !r.live_date);
+  const unexplainedRows = notLiveRows.filter(r => !r.capsule_tag && !r.not_live_remark);
+
+  // Average days to live: mean of delay (putaway -> live date) over rows with
+  // a non-null, non-negative delay. Negative delay = a later "new"-tagged
+  // restock landed after the SKU had already gone live off an earlier putaway
+  // (MAX date in a_agg) -- not a real launch lag, so excluded per instruction.
+  const delayRowsForAvg = rows.filter(r => r.delay !== null && r.delay >= 0);
+  const avgDaysToLive = delayRowsForAvg.length
+    ? delayRowsForAvg.reduce((a, r) => a + r.delay, 0) / delayRowsForAvg.length
+    : null;
+
+  return { rows, liveRows, last60Rows, notLiveRows, unexplainedRows, avgDaysToLive, delayRowsForAvg };
+}
+
+function renderLiveSkuKPIs(f){
+  const { liveRows, last60Rows, notLiveRows, unexplainedRows, avgDaysToLive, delayRowsForAvg } = computeLiveSkuFunnel(f);
+  const kpis = [
+    {label:'Total SKUs Live', value: fmtNum(liveRows.length), sub: 'live_date set, today WH qty > 5'},
+    {label:'Inwarded (Last 60 Days)', value: fmtNum(last60Rows.length), sub: 'days since inward < 60, today WH qty > 5'},
+    {label:'Not Live (of that lot)', value: fmtNum(notLiveRows.length), sub: 'no live_date yet'},
+    {label:'Unexplained Not-Live', value: fmtNum(unexplainedRows.length), sub: 'no capsule tag, no known blocker'},
+    {label:'Average Days to Live', value: avgDaysToLive!==null ? avgDaysToLive.toFixed(2) : '—', sub: delayRowsForAvg.length+' SKU groups, delay ≥ 0'},
+  ];
+  document.getElementById('kpi-row').innerHTML = kpis.map(k =>
+    `<div class="kpi"><div class="label">${k.label}</div><div class="value">${k.value}</div><div class="sub">${k.sub}</div></div>`
+  ).join('');
+}
+
+// Priority order matches the SQL's own CASE WHEN precedence for not_live_remark.
+const NOT_LIVE_REASON_ORDER = [
+  'CAPSULE',
+  'All colours not inwarded',
+  'Inward pending in both WH',
+  'Delivery pending in North',
+  'Delivery pending in South',
+  'No reason (unexplained)',
+];
+function liveSkuReasonOf(r){
+  if (r.capsule_tag) return 'CAPSULE';
+  if (r.not_live_remark) return r.not_live_remark;
+  return 'No reason (unexplained)';
+}
+const DELAY_BUCKETS = [
+  {label:'<5 days',    test: d => d < 5},
+  {label:'5-10 days',  test: d => d >= 5 && d < 10},
+  {label:'10-20 days', test: d => d >= 10 && d < 20},
+  {label:'>20 days',   test: d => d >= 20},
+];
+
+function renderLiveSkuTab(f){
+  const { notLiveRows } = computeLiveSkuFunnel(f);
+
+  const byReason = {};
+  NOT_LIVE_REASON_ORDER.forEach(r => byReason[r] = []);
+  notLiveRows.forEach(r => {
+    const reason = liveSkuReasonOf(r);
+    (byReason[reason] = byReason[reason] || []).push(r);
+  });
+  const reasonsPresent = NOT_LIVE_REASON_ORDER
+    .filter(r => byReason[r] && byReason[r].length > 0)
+    .sort((a, b) => byReason[b].length - byReason[a].length); // highest to lowest
+
+  const reasonCountRows = reasonsPresent.map(reason => `<tr>
+    <td class="rowlabel">${reason}</td><td>${byReason[reason].length}</td>
+  </tr>`).join('');
+  const reasonTotalRow = `<tr style="border-top:2px solid var(--line);">
+    <td class="rowlabel" style="font-weight:600;">Total</td><td style="font-weight:600;">${notLiveRows.length}</td>
+  </tr>`;
+
+  const bucketTotals = DELAY_BUCKETS.map(b => notLiveRows.filter(r => {
+    const pending = daysSincePutaway(r.date);
+    return pending !== null && b.test(pending);
+  }).length);
+  const delayRows = reasonsPresent.map(reason => {
+    const cells = DELAY_BUCKETS.map(b =>
+      `<td>${byReason[reason].filter(r => {
+        const pending = daysSincePutaway(r.date);
+        return pending !== null && b.test(pending);
+      }).length}</td>`
+    ).join('');
+    return `<tr><td class="rowlabel">${reason}</td>${cells}<td>${byReason[reason].length}</td></tr>`;
+  }).join('');
+  const delayTotalRow = `<tr style="border-top:2px solid var(--line);">
+    <td class="rowlabel" style="font-weight:600;">Total</td>
+    ${bucketTotals.map(c => `<td style="font-weight:600;">${c}</td>`).join('')}
+    <td style="font-weight:600;">${notLiveRows.length}</td>
+  </tr>`;
+
+  // Detail lists: same 7-col layout for both, sorted most-overdue first.
+  const unexplainedDetailRows = notLiveRows
+    .filter(r => liveSkuReasonOf(r) === 'No reason (unexplained)')
+    .sort((a, b) => (daysSincePutaway(b.date) ?? -1) - (daysSincePutaway(a.date) ?? -1));
+  const over10Rows = notLiveRows
+    .filter(r => { const p = daysSincePutaway(r.date); return p !== null && p > 10; })
+    .sort((a, b) => daysSincePutaway(b.date) - daysSincePutaway(a.date));
+
+  const skuDetailHeader = '<th>SKU Group</th><th>Category</th><th>Meta 1</th><th>Meta 2</th><th>Meta 3</th><th>Inward Date</th><th>Delta</th>';
+  const skuDetailRow = (r) => `<tr>
+    <td class="rowlabel">${r.sku_group}</td>
+    <td>${r.cat || '—'}</td>
+    <td>${r.m1 || '—'}</td>
+    <td>${r.m2 || '—'}</td>
+    <td>${r.m3 || '—'}</td>
+    <td>${fmtDMY(r.date) || '—'}</td>
+    <td>${daysSincePutaway(r.date) ?? '—'}</td>
+  </tr>`;
+  const skuDetailTable = (id, list) => buildCollapsibleTable(id, skuDetailHeader, list, skuDetailRow, 'No SKU groups match.');
+
+  document.getElementById('livesku-root').innerHTML = `
+    <div class="card-section">
+      <h2>Not-Live Breakdown <span class="rule"></span> <span class="count">${notLiveRows.length} SKU groups</span></h2>
+      <div class="pivot-strip">
+        <div class="pivot-block">
+          <h4>Reason for not being live</h4>
+          <table class="ptable">
+            <thead><tr><th>Reason</th><th>SKU Groups</th></tr></thead>
+            <tbody>${reasonCountRows ? reasonCountRows + reasonTotalRow : '<tr><td class="rowlabel dash" colspan="2">No not-live SKU groups in this slice</td></tr>'}</tbody>
+          </table>
+        </div>
+        <div class="pivot-block">
+          <h4>Delay since inward, by reason</h4>
+          <table class="ptable">
+            <thead><tr><th>Reason</th>${DELAY_BUCKETS.map(b => `<th>${b.label}</th>`).join('')}<th>Total</th></tr></thead>
+            <tbody>${delayRows ? delayRows + delayTotalRow : `<tr><td class="rowlabel dash" colspan="${DELAY_BUCKETS.length+2}">No not-live SKU groups in this slice</td></tr>`}</tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+    <div class="card-section">
+      <h2>Not-Live With No Reason <span class="rule"></span> <span class="count">${unexplainedDetailRows.length} SKU groups</span></h2>
+      ${skuDetailTable('livesku-unexplained', unexplainedDetailRows)}
+    </div>
+    <div class="card-section">
+      <h2>Not-Live, Delay &gt; 10 Days <span class="rule"></span> <span class="count">${over10Rows.length} SKU groups</span></h2>
+      ${skuDetailTable('livesku-over10', over10Rows)}
+    </div>`;
+}
+
+// Same prefix rule as the Live SKU Groups tab (MP-/FK-/PP-/B2B- listings
+// excluded, no dash required since PP/B2B don't always carry one), plus this
+// tab's own requirements: no live_date, or WH stock under 5 units, are both
+// excluded from every bucket below.
+function clicksExcluded(r){
+  const sku = (r.sku_group || '').toUpperCase();
+  if (sku.startsWith('MP-') || sku.startsWith('FK-') || sku.startsWith('PP') || sku.startsWith('B2B')) return true;
+  if (!r.live_date) return true;
+  if ((r.wh_qty || 0) < 5) return true;
+  return false;
+}
+
+const CLICKS_BUCKETS = [
+  {id:'below300', title:'WH Inventory < 300 Units', test: q => q < 300},
+  {id:'mid300500', title:'WH Inventory 300–500 Units', test: q => q >= 300 && q <= 500},
+  {id:'above500', title:'WH Inventory > 500 Units', test: q => q > 500},
+];
+
+function clicksThumb(r){
+  const url = r.image_url;
+  return url
+    ? `<img class="sku-thumb sku-thumb-lg" src="${url}" alt="${r.sku_group}" loading="lazy" onclick="event.stopPropagation(); openLightbox('${url.replace(/'/g,"\\'")}', '${r.sku_group.replace(/'/g,"\\'")}')" onerror="this.outerHTML='<span class=&quot;sku-thumb-placeholder sku-thumb-placeholder-lg&quot;></span>';">`
+    : `<span class="sku-thumb-placeholder sku-thumb-placeholder-lg"></span>`;
+}
+
+const CLICKS_TABLE_HEADER = `<th>SKU Group</th><th>Live Date</th><th>L1</th><th>Meta 1</th><th>Meta 2</th><th>Meta 3</th><th>WH Inv</th>
+  <th>Clicks 1-15</th><th>Clicks 15-30</th><th>Last 30 Days</th><th>Image Link</th><th>Image</th>`;
+function clicksRowHTML(r){
+  const link = r.image_url ? `<a href="${r.image_url}" target="_blank" rel="noopener">Link</a>` : '—';
+  return `<tr>
+    <td class="rowlabel">${r.sku_group}</td>
+    <td>${fmtDMY(r.live_date) || '—'}</td>
+    <td>${r.l1 || '—'}</td>
+    <td>${r.m1 || '—'}</td>
+    <td>${r.m2 || '—'}</td>
+    <td>${r.m3 || '—'}</td>
+    <td>${fmtNum(r.wh_qty)}</td>
+    <td>${fmtNum(r.clicks_1_15)}</td>
+    <td>${fmtNum(r.clicks_15_30)}</td>
+    <td>${fmtNum(r.clicks_last_30)}</td>
+    <td>${link}</td>
+    <td>${clicksThumb(r)}</td>
+  </tr>`;
+}
+
+function clicksBucketTableHTML(bucket, rowsList){
+  return buildCollapsibleTable(`clicks-${bucket.id}`, CLICKS_TABLE_HEADER, rowsList, clicksRowHTML, 'No SKU groups in this range.');
+}
+
+function renderClicksTab(f){
+  document.getElementById('kpi-row').innerHTML = '';
+  const rows = (DATA.clicks || []).filter(r => liveSkuMatchesFilter(r, f) && !clicksExcluded(r));
+  const sorted = [...rows].sort((a, b) => (b.wh_qty - a.wh_qty) || (b.clicks_last_30 - a.clicks_last_30));
+
+  const trendSection = `<div class="card-section">
+    <h2>Clicks — Last 6 Months (MoM) <span class="rule"></span></h2>
+    ${renderClicksTrendChart(f)}
+  </div>`;
+
+  const sections = CLICKS_BUCKETS.map(bucket => {
+    const bucketRows = sorted.filter(r => bucket.test(r.wh_qty));
+    return `<div class="card-section">
+      <h2>${bucket.title} <span class="rule"></span> <span class="count">${bucketRows.length} SKU groups</span></h2>
+      ${clicksBucketTableHTML(bucket, bucketRows)}
+    </div>`;
+  }).join('');
+
+  document.getElementById('clicks-root').innerHTML = trendSection + sections;
+}
+
+function clicksMonthlyExcluded(r){
+  const sku = (r.sku_group || '').toUpperCase();
+  return sku.startsWith('MP-') || sku.startsWith('FK-') || sku.startsWith('PP') || sku.startsWith('B2B');
+}
+const SHORT_MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+function monthLabelShort(monthKey){
+  const [y, m] = monthKey.split('-').map(Number);
+  return `${SHORT_MONTH_NAMES[m-1]} '${String(y).slice(2)}`;
+}
+function renderClicksTrendChart(f){
+  const rows = (DATA.clicks_monthly || []).filter(r => liveSkuMatchesFilter(r, f) && !clicksMonthlyExcluded(r));
+  const byMonth = {};
+  rows.forEach(r => { byMonth[r.month] = (byMonth[r.month] || 0) + r.clicks; });
+  // Drop the current, still-in-progress month -- it would show as a
+  // misleading cliff next to 6 full months of data.
+  const cur = currentMonthKey();
+  const months = Object.keys(byMonth).filter(m => m !== cur).sort().slice(-6);
+  if (!months.length) return '<div class="empty-note">No click data for the last 6 months in this slice.</div>';
+
+  const values = months.map(m => byMonth[m]);
+  const max = Math.max(...values, 1);
+  const W = 520, H = 180, padX = 40, padTop = 26, padBottom = 30;
+  const innerW = W - padX * 2, innerH = H - padTop - padBottom;
+  const pts = values.map((v, i) => ({
+    x: padX + (months.length === 1 ? innerW / 2 : i * innerW / (months.length - 1)),
+    y: padTop + innerH - (v / max) * innerH,
+    v, m: months[i],
+  }));
+  const linePoints = pts.map(p => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ');
+  const circles = pts.map(p => `<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="4" style="fill:var(--amber);"></circle>`).join('');
+  const valueLabels = pts.map(p => `<text x="${p.x.toFixed(1)}" y="${Math.max(14, p.y - 10).toFixed(1)}" text-anchor="middle" style="font-family:'IBM Plex Mono',monospace; font-size:12px; fill:var(--text-dim);">${fmtNum(p.v)}</text>`).join('');
+  const monthLabels = pts.map(p => `<text x="${p.x.toFixed(1)}" y="${H - 8}" text-anchor="middle" style="font-family:'IBM Plex Mono',monospace; font-size:12px; fill:var(--text-faint); text-transform:uppercase;">${monthLabelShort(p.m)}</text>`).join('');
+
+  return `<div class="clicks-chart-wrap" style="max-width:${W}px;">
+    <svg viewBox="0 0 ${W} ${H}" style="width:100%; height:${H}px; display:block;">
+      <polyline points="${linePoints}" style="fill:none; stroke:var(--amber); stroke-width:2;"></polyline>
+      ${circles}${valueLabels}${monthLabels}
+    </svg>
+  </div>`;
 }
 
 // fraction of a month elapsed, for the till-date pace check: 1 for fully-past
@@ -725,6 +1082,31 @@ function renderTracking(sales, leafKeys, f, qtyField, valField){
 //   Opening(m)    = real snapshot within m, if one exists; else Closing(m-1)
 //   Sales Left(m) = MAX(0, Target(m) - Actual(m))
 //   Closing(m)    = Opening(m) + Inwards(m) - Sales Left(m)
+// Resolves the date to treat as a given month's "closing snapshot date" for
+// DOI(L30D): the actual latest data date if m is the current (partial) month,
+// the calendar month-end if m is a fully-past month, or null if m is a future
+// month with no real closing data yet at all (never simulated for this metric).
+function monthAsOfDate(m){
+  const cur = currentMonthKey();
+  if (m > cur) return null;
+  if (m === cur) return latestDataDate();
+  const [y, mm] = m.split('-').map(Number);
+  const lastDay = new Date(Date.UTC(y, mm, 0)).getUTCDate();
+  return `${m}-${String(lastDay).padStart(2,'0')}`;
+}
+// Sums salesRows' valKey field over the 30 days ending (inclusive) at asOfDate.
+// NOTE: salesRows here come from the already MONTHS-filtered `sales` array
+// (Aug-Dec 2026 per the current dashboard window) -- fine today since every
+// trailing-30-day window needed falls inside that range, but if MONTHS is
+// ever narrowed to start later in the year this could under-count near the
+// start of that window. Flagging so it's not a silent surprise later.
+function trailing30SalesAt(salesRows, asOfDate, valKey){
+  const start = isoAddDays(asOfDate, -29);
+  let sum = 0;
+  salesRows.forEach(r => { if (r.date && r.date >= start && r.date <= asOfDate) sum += (r[valKey] || 0); });
+  return sum;
+}
+
 function computeLedger(entity, f, qtyField, valField){
   const valKey = metric === 'qty' ? 'qty' : 'cogs_sold';
   function realSnapshotAt(m){
@@ -743,6 +1125,7 @@ function computeLedger(entity, f, qtyField, valField){
   function inwardsAt(m){ return entity.leafKeys.reduce((a,lk) => a + inwardsForLeaf(lk, m), 0); }
 
   const opening = [], closing = [], salesLeft = [], target = [], actual = [], inwards = [];
+  const doiL30D = [], doiL30D_closing = [], doiL30D_l30dQty = [];
   for (let i = 0; i < MONTHS.length; i++){
     const m = MONTHS[i];
     target.push(targetAt(m));
@@ -759,8 +1142,24 @@ function computeLedger(entity, f, qtyField, valField){
 
     const closeVal = (openVal !== null && slVal !== null) ? (openVal + inwards[i] - slVal) : null;
     closing.push(closeVal);
+
+    // DOI(L30D): real closing snapshot at this month's "as-of" date, divided
+    // by that trailing-30-day sales rate. Only populated where a REAL closing
+    // snapshot exists (real !== null) -- never against the simulated future
+    // `closing` array above, and never fabricated for months with no data yet.
+    const asOf = monthAsOfDate(m);
+    if (real !== null && asOf !== null){
+      const l30dQty = trailing30SalesAt(entity.salesRows, asOf, valKey);
+      doiL30D.push(l30dQty > 0 ? (real * 30 / l30dQty) : null);
+      doiL30D_closing.push(real);
+      doiL30D_l30dQty.push(l30dQty);
+    } else {
+      doiL30D.push(null);
+      doiL30D_closing.push(null);
+      doiL30D_l30dQty.push(null);
+    }
   }
-  return { opening, closing, salesLeft, target, actual, inwards };
+  return { opening, closing, salesLeft, target, actual, inwards, doiL30D, doiL30D_closing, doiL30D_l30dQty };
 }
 
 function renderKPIs(sales, leafKeys, qtyField, valField, f){
@@ -781,6 +1180,13 @@ function renderKPIs(sales, leafKeys, qtyField, valField, f){
   const doi = (closingQty !== null && targetAtLastMonth) ? (closingQty * 30 / targetAtLastMonth) : null;
   const gm = salesGross ? ((salesGross - salesCogs) / salesGross * 100) : null;
 
+  // DOI(L30D): last available real (non-simulated) value in the ledger --
+  // i.e. whichever month currently has a real closing snapshot most recently
+  // (the current partial month, in practice).
+  let doiL30DIdx = -1;
+  for (let i = 0; i < MONTHS.length; i++){ if (ledger.doiL30D[i] !== null) doiL30DIdx = i; }
+  const doiL30D = doiL30DIdx >= 0 ? ledger.doiL30D[doiL30DIdx] : null;
+
   const kpis = [
     {label:'Sales Qty (Aug–Dec)', value: fmtNum(salesQty), sub: sales.length+' line items'},
     {label:'Sales COGS Value', value: '₹'+fmtNum(salesCogs), sub: 'gross ₹'+fmtNum(salesGross)},
@@ -788,6 +1194,7 @@ function renderKPIs(sales, leafKeys, qtyField, valField, f){
      sub: anyTarget ? fmtNum(totalTarget)+' units target' : 'no target for this slice yet'},
     {label:'Closing (simulated)', value: closingQty!==null ? fmtNum(closingQty)+' u' : '—', sub: lastMonthIdx>=0 ? 'as of '+MONTH_LABEL[MONTHS[lastMonthIdx]] : 'no data yet'},
     {label:'DOI (Closing/Target×30)', value: doi!==null ? doi.toFixed(0)+'d' : '—', sub: gm!==null ? 'GM '+gm.toFixed(1)+'%' : ''},
+    {label:'DOI (L30D actual rate)', value: doiL30D!==null ? doiL30D.toFixed(0)+'d' : '—', sub: doiL30DIdx>=0 ? 'as of '+MONTH_LABEL[MONTHS[doiL30DIdx]]+', real closing' : 'no real closing yet'},
   ];
   document.getElementById('kpi-row').innerHTML = kpis.map(k =>
     `<div class="kpi"><div class="label">${k.label}</div><div class="value">${k.value}</div><div class="sub">${k.sub}</div></div>`
@@ -805,6 +1212,7 @@ const DASHBOARD_BLOCKS = [
   {key:'inwards', title:'Inwards'},
   {key:'closing', title:'Closing (simulated)'},
   {key:'doi', title:'DOI (Closing/Target×30)', note:true, isDoi:true},
+  {key:'doiL30D', title:'DOI (L30D actual sales rate)', note:true, isDoiL30D:true},
 ];
 const TRACKING_BLOCKS = [
   {key:'target', title:'Sales Target (Full Month)', note:true},
@@ -888,6 +1296,11 @@ function renderCellForBlock(blockDef, ledger, i){
     const doi = c*30/t;
     return `<td class="doi-cell"><span class="doi-chip ${doiClass(doi)}">${doi.toFixed(0)}d</span></td>`;
   }
+  if (blockDef.isDoiL30D){
+    const doi = ledger.doiL30D[i];
+    if (doi===null||doi===undefined) return `<td class="doi-cell"><span class="doi-chip doi-none">—</span></td>`;
+    return `<td class="doi-cell"><span class="doi-chip ${doiClass(doi)}">${doi.toFixed(0)}d</span></td>`;
+  }
   const v = ledger[blockDef.key][i];
   if (blockDef.isDelta){
     if (v===null||v===undefined) return `<td class="dash">—</td>`;
@@ -921,6 +1334,16 @@ function computeTotal(rows, ledgers, blockDef, monthIndex){
     });
     if (!any || !targetSum) return null;
     return closingSum * 30 / targetSum;
+  }
+  if (blockDef.isDoiL30D){
+    let closingSum = 0, l30dSum = 0, any = false;
+    rows.forEach(r => {
+      const l = ledgers.get(r);
+      if (l.doiL30D_closing[monthIndex] !== null){ closingSum += l.doiL30D_closing[monthIndex]; any = true; }
+      if (l.doiL30D_l30dQty[monthIndex] !== null){ l30dSum += l.doiL30D_l30dQty[monthIndex]; }
+    });
+    if (!any || !l30dSum) return null;
+    return closingSum * 30 / l30dSum;
   }
   if (blockDef.isPercent){
     // Recompute from underlying actual/till-date-target sums, not an average of %s.
@@ -958,7 +1381,7 @@ function pivotBlockV2(blockDef, rows, def, ledgers, cardId, sortSpec){
   const totalCells = MONTHS.map((m,i) => {
     const t = computeTotal(rows, ledgers, blockDef, i);
     if (t === null || t === undefined) return `<td class="dash">—</td>`;
-    if (blockDef.isDoi) return `<td><span class="doi-chip ${doiClass(t)}">${t.toFixed(0)}d</span></td>`;
+    if (blockDef.isDoi || blockDef.isDoiL30D) return `<td><span class="doi-chip ${doiClass(t)}">${t.toFixed(0)}d</span></td>`;
     if (blockDef.isDelta){
       const cls = t>0?'delta-behind':(t<0?'delta-ahead':'');
       return `<td class="${cls}">${t>0?'+':''}${fmtNum(t)}</td>`;
@@ -1544,7 +1967,7 @@ function renderAnalyticsTab(){
         const invert = metricId === 'returns' || metricId === 'doi';
         const isGood = invert ? cell.pctChange < 0 : cell.pctChange > 0;
         const isBad = invert ? cell.pctChange > 0 : cell.pctChange < 0;
-        const intensity = Math.min(Math.abs(cell.pctChange) / 50, 1); // caps at ±50% change
+        const intensity = Math.min(Math.abs(cell.pctChange) / 50, 1); // caps at ┬▒50% change
         if (isGood){ bg = `rgba(111,163,131,${(0.10 + intensity*0.35).toFixed(2)})`; color = 'var(--green)'; }
         else if (isBad){ bg = `rgba(193,89,74,${(0.10 + intensity*0.35).toFixed(2)})`; color = 'var(--red)'; }
       }

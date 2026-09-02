@@ -87,6 +87,29 @@ TARGET_CHANNEL_MAP = {"Online - Shopify": "Shopify"}
 
 NEW_TOTAL_FILE = os.path.join(HERE, "data", "targets_new_total.xlsx")
 
+# V3 target file: direct Channel x L1 x Category x Meta1/2/3 x Month qty
+# targets for Sep-Dec 2026 (no Aug -- that month's already happened by the time
+# this file was built). Unlike the old approach (aggregate 4 category files +
+# apply channel-mix % to a separate all-channel total), this file already has
+# the exact channel split AND meta-level granularity built in -- no proration
+# needed. Covers ALL ~55 categories, not just the previous 4.
+TARGET_V3_FILE = os.path.join(HERE, "data", "Target_V3.xlsx")
+TARGET_V3_QTY_COLS = {
+    # column letter (1-indexed) -> (channel, month)
+    17: ("Shopify", "2026-09"), 18: ("Marketplace", "2026-09"), 19: ("Offline", "2026-09"),
+    20: ("Shopify", "2026-10"), 21: ("Marketplace", "2026-10"), 22: ("Offline", "2026-10"),
+    23: ("Shopify", "2026-11"), 24: ("Marketplace", "2026-11"), 25: ("Offline", "2026-11"),
+    26: ("Shopify", "2026-12"), 27: ("Marketplace", "2026-12"), 28: ("Offline", "2026-12"),
+}
+# The V3 file's Qty figures are NET (post-returns), but the rest of the
+# pipeline (and the dashboard's Net/Gross toggle) expects targets to be GROSS,
+# consistently with how Sales is stored gross and netted-down client-side.
+# We gross these up using real return rates computed from returns_actual
+# (Snowflake), capped at the same business-policy ceilings enforced elsewhere
+# in the app (see RETURN_CAPS in index.html) so a noisy/sparse rate can't
+# produce an absurd gross-up.
+RETURN_RATE_CAPS = {"Marketplace": 45, "Shopify": 30, "Offline": 0}
+
 
 # ---------------------------------------------------------------------------
 # Mode A: Google Sheets API via service account (authenticated, IMPORTRANGE-safe)
@@ -412,6 +435,688 @@ def fetch_images_from_snowflake():
 
 
 # ---------------------------------------------------------------------------
+# Snowflake: "new" SKU launch tracker (Live SKU Groups tab). One row per
+# SKU_group that's had a "new"-type putaway. Tracks whether it has gone live,
+# why it hasn't if not, current warehouse/offline stock, and sales since its
+# putaway date. See chat for the full field-by-field breakdown.
+# ---------------------------------------------------------------------------
+LIVE_SKU_QUERY = r"""
+with a as (SELECT
+            upper(
+                trim(
+                    REVERSE(
+                        SUBSTRING(
+                            REVERSE("Item Type skuCode"),
+                            CHARINDEX('-', REVERSE("Item Type skuCode")) + 1,
+                            LEN("Item Type skuCode")
+                        )
+                    )
+                )
+            ) AS SKU_group,
+            LOWER(FINAL_TYPE) type,
+            "PUTAWAY_UPDATED"::DATE as date,
+            SUM("PUTAWAY_COMPLETED_QUANTITY") AS Qty
+        FROM
+            snitch_db.maplemonk.putaway_tracking
+        WHERE
+            "PUTAWAY_UPDATED"::DATE < CURRENT_DATE()
+            and LOWER(FINAL_TYPE) like'new%'
+        GROUP BY
+            1,2,3),
+a_agg as (
+    SELECT
+        SKU_group,
+        MAX(date) as date,
+        SUM(qty) as qty
+    FROM a
+    GROUP BY 1
+),
+meta_map AS (
+    SELECT
+       UPPER(
+            IFF(
+                UPPER(REPLACE(SKU_GROUP, ' ', '')) LIKE 'MP%'
+                OR UPPER(REPLACE(SKU_GROUP, ' ', '')) LIKE '4C-%',
+                REGEXP_REPLACE(REPLACE(SKU_GROUP, ' ', ''), '^([^-]+-[^-]+).*$', '\1'),
+                REGEXP_REPLACE(REPLACE(SKU_GROUP, ' ', ''), '-.*$', '')
+            )
+        ) AS sku_group_clean,
+       COALESCE(
+            MIN(CASE WHEN UPPER(TRIM(a.l1_category)) = 'LONG TAIL' THEN a.l1_category END),
+            MIN(CASE WHEN UPPER(TRIM(a.l1_category)) = 'PLUS' THEN a.l1_category END),
+            MIN(CASE WHEN UPPER(TRIM(a.l1_category)) = 'LUXE' THEN a.l1_category END),
+            MIN(CASE WHEN UPPER(TRIM(a.l1_category)) = 'SNITCH' THEN a.l1_category END),
+            MIN(a.l1_category)
+        ) AS l1_category,
+        COALESCE(
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'SHIRTS' THEN a.category END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'TSHIRTS' THEN a.category END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'JEANS' THEN a.category END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'TROUSERS' THEN a.category END),
+            MIN(a.category)
+        ) AS category,
+        COALESCE(
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'SHIRTS' THEN a.meta1 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'TSHIRTS' THEN a.meta1 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'JEANS' THEN a.meta1 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'TROUSERS' THEN a.meta1 END),
+            MIN(a.meta1)
+        ) AS meta1,
+        COALESCE(
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'SHIRTS' THEN a.meta2 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'TSHIRTS' THEN a.meta2 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'JEANS' THEN a.meta2 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'TROUSERS' THEN a.meta2 END),
+            MIN(a.meta2)
+        ) AS meta2,
+        COALESCE(
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'SHIRTS' THEN a.meta3 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'TSHIRTS' THEN a.meta3 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'JEANS' THEN a.meta3 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'TROUSERS' THEN a.meta3 END),
+            MIN(a.meta3)
+        ) AS meta3,
+        max(cogs) as cogs
+    FROM snitch_db.maplemonk.meta_mapping_cogs_sku a
+    GROUP BY 1
+),
+lkp_agg AS (
+    SELECT
+        TRIM(UPPER(SKU_GROUP)) AS sku_group_lkp,
+        MAX(FINAL_LIVE_DATE) AS FINAL_LIVE_DATE
+    FROM snitch_db.maplemonk.base_product
+    GROUP BY 1
+),
+avl_agg AS (
+    SELECT
+        TRIM(UPPER(SKU_GROUP)) AS sku_group_avl,
+        MAX(STATUS) AS STATUS,
+        MAX(SKU_CLASS) AS SKU_CLASS
+    FROM snitch_db.maplemonk.availability_master_v2
+    GROUP BY 1
+),
+offline_agg AS (
+    SELECT
+        TRIM(UPPER(SKU_GROUP)) AS sku_group_off,
+        SUM(INVENTORY) AS total_inventory,
+        SUM(JIT_QTY) AS total_jit_qty,
+        COUNT(DISTINCT MARKETPLACE_MAPPED) AS store_count
+    FROM snitch_db.maplemonk.offline_master
+    GROUP BY 1
+),
+total_stores AS (
+    SELECT COUNT(DISTINCT MARKETPLACE_MAPPED) AS total_store_count
+    FROM snitch_db.maplemonk.offline_master
+),
+wh_inv AS (
+    SELECT
+        date,
+        TRIM(
+            UPPER(
+                REVERSE(
+                    SUBSTRING(
+                        REVERSE("Item SkuCode"),
+                        POSITION('-' IN REVERSE("Item SkuCode")) + 1
+                    )
+                )
+            )
+        ) AS sku_group,
+        SUM(inventory) AS wh_qty
+    FROM snitch_db.maplemonk.snitch_final_inventory_wh2
+    WHERE facility IN ('SAPL-WH2', 'SAPL-WH1', 'SAPL-NORTH-TAURU')
+      AND date = CURRENT_DATE()
+    GROUP BY 1, 2
+),
+today_wh_inv AS (
+    SELECT
+        sku_group AS sku_group_wh,
+        SUM(wh_qty) AS today_wh_qty
+    FROM wh_inv
+    GROUP BY 1
+),
+sales_since_live AS (
+    SELECT
+        TRIM(UPPER(h.SKU_GROUP)) AS sku_group_sales,
+        SUM(CASE WHEN h.TYPE = 'Store' THEN h.GROSS_QUANTITY ELSE 0 END) AS units_sold_offline,
+        SUM(CASE WHEN h.TYPE = 'Shopify' THEN h.GROSS_QUANTITY ELSE 0 END) AS units_sold_shopify,
+        SUM(CASE WHEN h.TYPE = 'Marketplace' THEN h.GROSS_QUANTITY ELSE 0 END) AS units_sold_marketplace,
+        SUM(h.GROSS_QUANTITY) AS units_sold_total
+    FROM snitch_db.maplemonk.horizontal_sales_categories h
+    INNER JOIN a_agg ag
+        ON TRIM(UPPER(ag.SKU_GROUP)) = TRIM(UPPER(h.SKU_GROUP))
+    WHERE h.DATE::DATE >= ag.date
+    GROUP BY 1
+),
+pipeline_skus AS (
+    SELECT DISTINCT CASE
+        WHEN subvention IS NULL OR TRIM(subvention) = '' THEN NULL
+        ELSE
+            SPLIT_PART(
+                CASE
+                    WHEN LEFT(REPLACE(TRIM(SPLIT_PART(subvention, '/', 1)), ' ', ''), 2) = 'R4'
+                    THEN '4' || SUBSTR(REPLACE(TRIM(SPLIT_PART(subvention, '/', 1)), ' ', ''), 3)
+                    ELSE REPLACE(TRIM(SPLIT_PART(subvention, '/', 1)), ' ', '')
+                END,
+                '-', 1
+            )
+            ||
+            CASE
+                WHEN SPLIT_PART(
+                    CASE
+                        WHEN LEFT(REPLACE(TRIM(SPLIT_PART(subvention, '/', 1)), ' ', ''), 2) = 'R4'
+                        THEN '4' || SUBSTR(REPLACE(TRIM(SPLIT_PART(subvention, '/', 1)), ' ', ''), 3)
+                        ELSE REPLACE(TRIM(SPLIT_PART(subvention, '/', 1)), ' ', '')
+                    END,
+                    '-', 2
+                ) <> ''
+                THEN '-' || SPLIT_PART(
+                    CASE
+                        WHEN LEFT(REPLACE(TRIM(SPLIT_PART(subvention, '/', 1)), ' ', ''), 2) = 'R4'
+                        THEN '4' || SUBSTR(REPLACE(TRIM(SPLIT_PART(subvention, '/', 1)), ' ', ''), 3)
+                        ELSE REPLACE(TRIM(SPLIT_PART(subvention, '/', 1)), ' ', '')
+                    END,
+                    '-', 2
+                )
+                ELSE ''
+            END
+    END AS normalized_sku
+    FROM snitch_db.maplemonk.gs_product_tracking_new_main
+    WHERE sku_status_ not in ('Delivered', 'Cancel', 'Hold')
+        and LOWER(sku_status_) not LIKE 'deliver%'
+        and LOWER(sku_status_) not LIKE 'cancel%'
+        and LOWER(sku_status_) not LIKE 'hold'
+),
+pipeline_variants AS (
+    SELECT DISTINCT
+        REGEXP_REPLACE(normalized_sku, '-[^-]+$', '') AS parent_sku,
+        UPPER(TRIM(normalized_sku)) AS variant_key
+    FROM pipeline_skus
+    WHERE normalized_sku IS NOT NULL
+),
+logic_variants AS (
+    SELECT DISTINCT
+        UPPER(TRIM(SKU_MAPPING)) AS parent_sku,
+        UPPER(TRIM(SKU_MAPPING)) || '-' || UPPER(TRIM(COLOR)) AS variant_key
+    FROM snitch_db.maplemonk.logic_final_item_master
+    WHERE SKU_MAPPING IS NOT NULL AND COLOR IS NOT NULL
+),
+expected_colors AS (
+    SELECT parent_sku, COUNT(DISTINCT variant_key) AS expected_colors
+    FROM (
+        SELECT parent_sku, variant_key FROM pipeline_variants
+        UNION
+        SELECT parent_sku, variant_key FROM logic_variants
+    )
+    GROUP BY 1
+),
+actual_colors AS (
+    SELECT
+        REGEXP_REPLACE(SKU_group, '-[^-]+$', '') AS parent_sku,
+        COUNT(DISTINCT SKU_group) AS actual_colors
+    FROM a_agg
+    GROUP BY 1
+),
+capsule_map AS (
+    SELECT DISTINCT TRIM(UPPER(SKU)) AS sku_group_capsule
+    FROM snitch_db.maplemonk.collection_sku_mapped_sheet1
+),
+delivery_status_map AS (
+    SELECT
+        TRIM(UPPER(SKU_GROUP)) AS sku_group_delivery,
+        MAX(DELIVERY_STATUS_NORTH) AS delivery_status_north,
+        MAX(DELIVERY_STATUS_SOUTH) AS delivery_status_south,
+        MAX(NORTH_PO) AS north_po,
+        MAX(NORTH_INWARDED) AS north_inwarded,
+        MAX(SOUTH_PO) AS south_po,
+        MAX(SOUTH_INWARDED) AS south_inwarded
+    FROM snitch_db.maplemonk.SKU_LIVE_MECH_V2
+    GROUP BY 1
+)
+select
+    a_agg.date,
+    a_agg.sku_group,
+    meta_map.l1_category,
+    meta_map.category,
+    meta_map.meta1,
+    meta_map.meta2,
+    meta_map.meta3,
+    lkp_agg.FINAL_LIVE_DATE,
+    avl_agg.STATUS,
+    avl_agg.SKU_CLASS,
+    a_agg.qty*meta_map.cogs as cogs_value,
+    a_agg.qty as qty,
+    DATEDIFF(day, a_agg.date, lkp_agg.FINAL_LIVE_DATE) as delay,
+    offline_agg.total_inventory,
+    offline_agg.total_jit_qty,
+    offline_agg.store_count,
+    total_stores.total_store_count,
+    total_stores.total_store_count - COALESCE(offline_agg.store_count, 0) AS stores_not_allocated,
+    today_wh_inv.today_wh_qty,
+    sales_since_live.units_sold_offline,
+    sales_since_live.units_sold_shopify,
+    sales_since_live.units_sold_marketplace,
+    sales_since_live.units_sold_total,
+    CASE WHEN capsule_map.sku_group_capsule IS NOT NULL THEN 'CAPSULE' END AS capsule_tag,
+    CASE
+        WHEN lkp_agg.FINAL_LIVE_DATE IS NULL
+         AND avl_agg.SKU_CLASS <> 'MP'
+         AND actual_colors.actual_colors < expected_colors.expected_colors
+        THEN 'All colours not inwarded'
+
+        WHEN lkp_agg.FINAL_LIVE_DATE IS NULL
+         AND avl_agg.SKU_CLASS <> 'MP'
+         AND (
+                UPPER(TRIM(delivery_status_map.delivery_status_north)) LIKE '%NOT_YET%'
+             OR (delivery_status_map.north_po > 0 AND COALESCE(delivery_status_map.north_inwarded, 0) < delivery_status_map.north_po)
+             )
+         AND (
+                UPPER(TRIM(delivery_status_map.delivery_status_south)) LIKE '%NOT_YET%'
+             OR (delivery_status_map.south_po > 0 AND COALESCE(delivery_status_map.south_inwarded, 0) < delivery_status_map.south_po)
+             )
+        THEN 'Inward pending in both WH'
+
+        WHEN lkp_agg.FINAL_LIVE_DATE IS NULL
+         AND avl_agg.SKU_CLASS <> 'MP'
+         AND (
+                UPPER(TRIM(delivery_status_map.delivery_status_north)) LIKE '%NOT_YET%'
+             OR (delivery_status_map.north_po > 0 AND COALESCE(delivery_status_map.north_inwarded, 0) < delivery_status_map.north_po)
+             )
+        THEN 'Delivery pending in North'
+
+        WHEN lkp_agg.FINAL_LIVE_DATE IS NULL
+         AND avl_agg.SKU_CLASS <> 'MP'
+         AND (
+                UPPER(TRIM(delivery_status_map.delivery_status_south)) LIKE '%NOT_YET%'
+             OR (delivery_status_map.south_po > 0 AND COALESCE(delivery_status_map.south_inwarded, 0) < delivery_status_map.south_po)
+             )
+        THEN 'Delivery pending in South'
+    END AS not_live_remark
+from a_agg
+cross join total_stores
+left join meta_map
+    on meta_map.sku_group_clean = UPPER(
+        IFF(
+            UPPER(REPLACE(a_agg.SKU_GROUP, ' ', '')) LIKE 'MP%'
+            OR UPPER(REPLACE(a_agg.SKU_GROUP, ' ', '')) LIKE '4C-%',
+            REGEXP_REPLACE(REPLACE(a_agg.SKU_GROUP, ' ', ''), '^([^-]+-[^-]+).*$', '\1'),
+            REGEXP_REPLACE(REPLACE(a_agg.SKU_GROUP, ' ', ''), '-.*$', '')
+        )
+    )
+left join lkp_agg
+    on lkp_agg.sku_group_lkp = TRIM(UPPER(a_agg.SKU_GROUP))
+left join avl_agg
+    on avl_agg.sku_group_avl = TRIM(UPPER(a_agg.SKU_GROUP))
+left join offline_agg
+    on offline_agg.sku_group_off = TRIM(UPPER(a_agg.SKU_GROUP))
+left join today_wh_inv
+    on today_wh_inv.sku_group_wh = TRIM(UPPER(a_agg.SKU_GROUP))
+left join sales_since_live
+    on sales_since_live.sku_group_sales = TRIM(UPPER(a_agg.SKU_GROUP))
+left join expected_colors
+    on expected_colors.parent_sku = REGEXP_REPLACE(a_agg.SKU_group, '-[^-]+$', '')
+left join actual_colors
+    on actual_colors.parent_sku = REGEXP_REPLACE(a_agg.SKU_group, '-[^-]+$', '')
+left join capsule_map
+    on capsule_map.sku_group_capsule = TRIM(UPPER(a_agg.SKU_GROUP))
+left join delivery_status_map
+    on delivery_status_map.sku_group_delivery = TRIM(UPPER(a_agg.SKU_GROUP))
+"""
+
+
+def fetch_live_sku_groups_from_snowflake():
+    conn = _snowflake_connect()
+    try:
+        cur = conn.cursor()
+        print("Fetching Live SKU Groups (new-launch tracker) from putaway_tracking...")
+        cur.execute(LIVE_SKU_QUERY)
+        rows = cur.fetchall()
+        cur.close()
+    finally:
+        conn.close()
+
+    def _d(v):
+        if v is None:
+            return None
+        return v.strftime("%Y-%m-%d") if hasattr(v, "strftime") else str(v)[:10]
+
+    live_sku_groups = []
+    for row in rows:
+        (date, sku_group, l1, cat, m1, m2, m3, final_live_date, status, sku_class,
+         cogs_value, qty, delay, total_inventory, total_jit_qty, store_count,
+         total_store_count, stores_not_allocated, today_wh_qty,
+         units_sold_offline, units_sold_shopify, units_sold_marketplace, units_sold_total,
+         capsule_tag, not_live_remark) = row
+        live_sku_groups.append({
+            "date": _d(date), "sku_group": sku_group, "l1": l1, "cat": cat, "m1": m1, "m2": m2, "m3": m3,
+            "live_date": _d(final_live_date), "status": status, "sku_class": sku_class,
+            "cogs_value": float(cogs_value or 0), "qty": float(qty or 0), "delay": int(delay) if delay is not None else None,
+            "total_inventory": float(total_inventory or 0), "total_jit_qty": float(total_jit_qty or 0),
+            "store_count": int(store_count or 0), "total_store_count": int(total_store_count or 0),
+            "stores_not_allocated": int(stores_not_allocated or 0), "today_wh_qty": float(today_wh_qty or 0),
+            "units_sold_offline": float(units_sold_offline or 0), "units_sold_shopify": float(units_sold_shopify or 0),
+            "units_sold_marketplace": float(units_sold_marketplace or 0), "units_sold_total": float(units_sold_total or 0),
+            "capsule_tag": capsule_tag, "not_live_remark": not_live_remark,
+        })
+    print(f"  -> {len(live_sku_groups)} live SKU group rows from Snowflake")
+    return live_sku_groups
+
+
+# ---------------------------------------------------------------------------
+# Snowflake: post-launch click performance (Clicks tab). One row per live
+# SKU_group (FINAL_LIVE_DATE required, MP/FK/B2B/PP prefixes excluded at the
+# source), with clicks in its first 15 days live, next 15 days, and the
+# trailing 30 days -- alongside current warehouse stock, for spotting
+# well-stocked-but-cold SKUs vs. thin-stocked-but-hot ones.
+# ---------------------------------------------------------------------------
+CLICKS_QUERY = r"""
+with a as (
+    SELECT
+        upper(trim(REVERSE(SUBSTRING(REVERSE("Item Type skuCode"),CHARINDEX('-', REVERSE("Item Type skuCode")) + 1,LEN("Item Type skuCode"))))) AS SKU_group,
+        LOWER(FINAL_TYPE) type,
+        "PUTAWAY_UPDATED"::DATE as date,
+        SUM("PUTAWAY_COMPLETED_QUANTITY") AS Qty
+    FROM snitch_db.maplemonk.putaway_tracking
+    WHERE "PUTAWAY_UPDATED"::DATE < CURRENT_DATE()
+      and LOWER(FINAL_TYPE) like 'new%'
+    GROUP BY 1,2,3
+),
+a_agg as (
+    SELECT SKU_group, MAX(date) as date, SUM(qty) as qty
+    FROM a
+    GROUP BY 1
+),
+meta_map AS (
+    SELECT
+        UPPER(
+            IFF(
+                UPPER(REPLACE(SKU_GROUP, ' ', '')) LIKE 'MP%'
+                OR UPPER(REPLACE(SKU_GROUP, ' ', '')) LIKE '4C-%',
+                REGEXP_REPLACE(REPLACE(SKU_GROUP, ' ', ''), '^([^-]+-[^-]+).*$', '\1'),
+                REGEXP_REPLACE(REPLACE(SKU_GROUP, ' ', ''), '-.*$', '')
+            )
+        ) AS sku_group_clean,
+        COALESCE(
+            MIN(CASE WHEN UPPER(TRIM(a.l1_category)) = 'LONG TAIL' THEN a.l1_category END),
+            MIN(CASE WHEN UPPER(TRIM(a.l1_category)) = 'PLUS' THEN a.l1_category END),
+            MIN(CASE WHEN UPPER(TRIM(a.l1_category)) = 'LUXE' THEN a.l1_category END),
+            MIN(CASE WHEN UPPER(TRIM(a.l1_category)) = 'SNITCH' THEN a.l1_category END),
+            MIN(a.l1_category)
+        ) AS l1_category,
+        COALESCE(
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'SHIRTS' THEN a.category END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'TSHIRTS' THEN a.category END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'JEANS' THEN a.category END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'TROUSERS' THEN a.category END),
+            MIN(a.category)
+        ) AS category,
+        COALESCE(
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'SHIRTS' THEN a.meta1 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'TSHIRTS' THEN a.meta1 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'JEANS' THEN a.meta1 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'TROUSERS' THEN a.meta1 END),
+            MIN(a.meta1)
+        ) AS meta1,
+        COALESCE(
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'SHIRTS' THEN a.meta2 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'TSHIRTS' THEN a.meta2 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'JEANS' THEN a.meta2 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'TROUSERS' THEN a.meta2 END),
+            MIN(a.meta2)
+        ) AS meta2,
+        COALESCE(
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'SHIRTS' THEN a.meta3 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'TSHIRTS' THEN a.meta3 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'JEANS' THEN a.meta3 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'TROUSERS' THEN a.meta3 END),
+            MIN(a.meta3)
+        ) AS meta3
+    FROM snitch_db.maplemonk.meta_mapping_cogs_sku a
+    GROUP BY 1
+),
+lkp_agg AS (
+    SELECT
+        TRIM(UPPER(SKU_GROUP)) AS sku_group_lkp,
+        MAX(FINAL_LIVE_DATE) AS FINAL_LIVE_DATE
+    FROM snitch_db.maplemonk.base_product
+    GROUP BY 1
+),
+wh_inv AS (
+    SELECT
+        date,
+        TRIM(UPPER(REVERSE(SUBSTRING(REVERSE("Item SkuCode"), POSITION('-' IN REVERSE("Item SkuCode")) + 1)))) AS sku_group,
+        SUM(inventory) AS wh_qty
+    FROM snitch_db.maplemonk.snitch_final_inventory_wh2
+    WHERE facility IN ('SAPL-WH2', 'SAPL-WH1', 'SAPL-NORTH-TAURU')
+      AND date = CURRENT_DATE()
+    GROUP BY 1, 2
+),
+today_wh_inv AS (
+    SELECT sku_group AS sku_group_wh, SUM(wh_qty) AS today_wh_qty
+    FROM wh_inv
+    GROUP BY 1
+),
+clicks_agg AS (
+    SELECT
+        TRIM(UPPER(SKU_GROUP)) AS sku_group_clicks,
+        ga_date::DATE AS click_date,
+        SUM(clicks) AS clicks
+    FROM snitch_db.maplemonk.clicks_itemid
+    GROUP BY 1, 2
+),
+image_agg AS (
+    SELECT
+        TRIM(UPPER(sku_group)) AS sku_group_image,
+        MAX(image_url) AS image_url
+    FROM (
+        SELECT
+            LEFT(variant.value:sku::STRING, LENGTH(variant.value:sku::STRING) - POSITION('-' IN REVERSE(variant.value:sku::STRING))) AS sku_group,
+            image.value:"preview":"image":"url"::string AS image_url
+        FROM
+            snitch_db.maplemonk.new_meafields_product_products_graph_ql t,
+            LATERAL FLATTEN(input => parse_json(t.media)) AS image,
+            LATERAL FLATTEN(input => PARSE_JSON(t.variants)) AS variant
+        WHERE
+            image.value:"mediaContentType"::string = 'IMAGE'
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY t.id ORDER BY image.index) = 1
+    )
+    GROUP BY 1
+)
+select
+    a_agg.SKU_group,
+    lkp_agg.FINAL_LIVE_DATE,
+    meta_map.l1_category,
+    meta_map.category,
+    meta_map.meta1,
+    meta_map.meta2,
+    meta_map.meta3,
+    today_wh_inv.today_wh_qty AS total_wh_inventory,
+    SUM(CASE WHEN c.click_date BETWEEN lkp_agg.FINAL_LIVE_DATE AND DATEADD(day, 14, lkp_agg.FINAL_LIVE_DATE) THEN c.clicks ELSE 0 END) AS clicks_day_1_15,
+    SUM(CASE WHEN c.click_date BETWEEN DATEADD(day, 15, lkp_agg.FINAL_LIVE_DATE) AND DATEADD(day, 29, lkp_agg.FINAL_LIVE_DATE) THEN c.clicks ELSE 0 END) AS clicks_day_15_30,
+    SUM(CASE WHEN c.click_date BETWEEN DATEADD(day, -30, CURRENT_DATE()) AND CURRENT_DATE() THEN c.clicks ELSE 0 END) AS clicks_last_30_days,
+    image_agg.image_url
+from a_agg
+left join meta_map
+    on meta_map.sku_group_clean = UPPER(
+        IFF(
+            UPPER(REPLACE(a_agg.SKU_GROUP, ' ', '')) LIKE 'MP%'
+            OR UPPER(REPLACE(a_agg.SKU_GROUP, ' ', '')) LIKE '4C-%',
+            REGEXP_REPLACE(REPLACE(a_agg.SKU_GROUP, ' ', ''), '^([^-]+-[^-]+).*$', '\1'),
+            REGEXP_REPLACE(REPLACE(a_agg.SKU_GROUP, ' ', ''), '-.*$', '')
+        )
+    )
+inner join lkp_agg
+    on lkp_agg.sku_group_lkp = TRIM(UPPER(a_agg.SKU_GROUP))
+    and lkp_agg.FINAL_LIVE_DATE IS NOT NULL
+left join today_wh_inv
+    on today_wh_inv.sku_group_wh = TRIM(UPPER(a_agg.SKU_GROUP))
+left join clicks_agg c
+    on c.sku_group_clicks = TRIM(UPPER(a_agg.SKU_GROUP))
+left join image_agg
+    on image_agg.sku_group_image = TRIM(UPPER(a_agg.SKU_GROUP))
+where
+    UPPER(a_agg.SKU_GROUP) NOT LIKE 'MP%'
+    AND UPPER(a_agg.SKU_GROUP) NOT LIKE 'FK%'
+    AND UPPER(a_agg.SKU_GROUP) NOT LIKE 'B2B%'
+    AND UPPER(a_agg.SKU_GROUP) NOT LIKE 'PP%'
+group by
+    a_agg.SKU_group,
+    lkp_agg.FINAL_LIVE_DATE,
+    meta_map.l1_category,
+    meta_map.category,
+    meta_map.meta1,
+    meta_map.meta2,
+    meta_map.meta3,
+    today_wh_inv.today_wh_qty,
+    image_agg.image_url
+order by
+    total_wh_inventory DESC,
+    clicks_last_30_days DESC
+"""
+
+
+def fetch_clicks_from_snowflake():
+    conn = _snowflake_connect()
+    try:
+        cur = conn.cursor()
+        print("Fetching Clicks (post-launch click performance) from clicks_itemid...")
+        cur.execute(CLICKS_QUERY)
+        rows = cur.fetchall()
+        cur.close()
+    finally:
+        conn.close()
+
+    def _d(v):
+        if v is None:
+            return None
+        return v.strftime("%Y-%m-%d") if hasattr(v, "strftime") else str(v)[:10]
+
+    clicks = []
+    for row in rows:
+        (sku_group, final_live_date, l1, cat, m1, m2, m3, total_wh_inventory,
+         clicks_1_15, clicks_15_30, clicks_last_30, image_url) = row
+        clicks.append({
+            "sku_group": sku_group, "live_date": _d(final_live_date), "l1": l1, "cat": cat,
+            "m1": m1, "m2": m2, "m3": m3, "wh_qty": float(total_wh_inventory or 0),
+            "clicks_1_15": float(clicks_1_15 or 0), "clicks_15_30": float(clicks_15_30 or 0),
+            "clicks_last_30": float(clicks_last_30 or 0), "image_url": image_url,
+        })
+    print(f"  -> {len(clicks)} clicks rows from Snowflake")
+    return clicks
+
+
+# Separate monthly-grain click totals (last 6 calendar months, all SKU groups
+# with any clicks, not just live ones) for the Clicks tab's MoM trend chart.
+# Kept as its own query/output key rather than folded into CLICKS_QUERY since
+# it answers a different question (overall click volume trend) at a
+# different grain (month, not launch-relative windows).
+CLICKS_MONTHLY_QUERY = r"""
+WITH meta_map AS (
+    SELECT
+        UPPER(
+            IFF(
+                UPPER(REPLACE(SKU_GROUP, ' ', '')) LIKE 'MP%'
+                OR UPPER(REPLACE(SKU_GROUP, ' ', '')) LIKE '4C-%',
+                REGEXP_REPLACE(REPLACE(SKU_GROUP, ' ', ''), '^([^-]+-[^-]+).*$', '\1'),
+                REGEXP_REPLACE(REPLACE(SKU_GROUP, ' ', ''), '-.*$', '')
+            )
+        ) AS sku_group_clean,
+        COALESCE(
+            MIN(CASE WHEN UPPER(TRIM(a.l1_category)) = 'LONG TAIL' THEN a.l1_category END),
+            MIN(CASE WHEN UPPER(TRIM(a.l1_category)) = 'PLUS' THEN a.l1_category END),
+            MIN(CASE WHEN UPPER(TRIM(a.l1_category)) = 'LUXE' THEN a.l1_category END),
+            MIN(CASE WHEN UPPER(TRIM(a.l1_category)) = 'SNITCH' THEN a.l1_category END),
+            MIN(a.l1_category)
+        ) AS l1_category,
+        COALESCE(
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'SHIRTS' THEN a.category END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'TSHIRTS' THEN a.category END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'JEANS' THEN a.category END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'TROUSERS' THEN a.category END),
+            MIN(a.category)
+        ) AS category,
+        COALESCE(
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'SHIRTS' THEN a.meta1 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'TSHIRTS' THEN a.meta1 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'JEANS' THEN a.meta1 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'TROUSERS' THEN a.meta1 END),
+            MIN(a.meta1)
+        ) AS meta1,
+        COALESCE(
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'SHIRTS' THEN a.meta2 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'TSHIRTS' THEN a.meta2 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'JEANS' THEN a.meta2 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'TROUSERS' THEN a.meta2 END),
+            MIN(a.meta2)
+        ) AS meta2,
+        COALESCE(
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'SHIRTS' THEN a.meta3 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'TSHIRTS' THEN a.meta3 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'JEANS' THEN a.meta3 END),
+            MIN(CASE WHEN UPPER(TRIM(a.category)) = 'TROUSERS' THEN a.meta3 END),
+            MIN(a.meta3)
+        ) AS meta3
+    FROM snitch_db.maplemonk.meta_mapping_cogs_sku a
+    GROUP BY 1
+),
+agg AS (
+    SELECT
+        TRIM(UPPER(SKU_GROUP)) AS sku_group_clicks,
+        DATE_TRUNC('month', ga_date)::DATE AS month,
+        SUM(clicks) AS clicks
+    FROM snitch_db.maplemonk.clicks_itemid
+    WHERE ga_date >= DATEADD(month, -6, DATE_TRUNC('month', CURRENT_DATE()))
+    GROUP BY 1, 2
+)
+SELECT
+    agg.sku_group_clicks,
+    TO_CHAR(agg.month, 'YYYY-MM') AS month,
+    agg.clicks,
+    meta_map.l1_category,
+    meta_map.category,
+    meta_map.meta1,
+    meta_map.meta2,
+    meta_map.meta3
+FROM agg
+LEFT JOIN meta_map
+    ON meta_map.sku_group_clean = UPPER(
+        IFF(
+            UPPER(REPLACE(agg.sku_group_clicks, ' ', '')) LIKE 'MP%'
+            OR UPPER(REPLACE(agg.sku_group_clicks, ' ', '')) LIKE '4C-%',
+            REGEXP_REPLACE(REPLACE(agg.sku_group_clicks, ' ', ''), '^([^-]+-[^-]+).*$', '\1'),
+            REGEXP_REPLACE(REPLACE(agg.sku_group_clicks, ' ', ''), '-.*$', '')
+        )
+    )
+WHERE
+    UPPER(agg.sku_group_clicks) NOT LIKE 'MP%'
+    AND UPPER(agg.sku_group_clicks) NOT LIKE 'FK%'
+    AND UPPER(agg.sku_group_clicks) NOT LIKE 'B2B%'
+    AND UPPER(agg.sku_group_clicks) NOT LIKE 'PP%'
+"""
+
+
+def fetch_clicks_monthly_from_snowflake():
+    conn = _snowflake_connect()
+    try:
+        cur = conn.cursor()
+        print("Fetching Clicks Monthly (last 6 months MoM trend) from clicks_itemid...")
+        cur.execute(CLICKS_MONTHLY_QUERY)
+        rows = cur.fetchall()
+        cur.close()
+    finally:
+        conn.close()
+
+    clicks_monthly = []
+    for row in rows:
+        sku_group, month, clicks_val, l1, cat, m1, m2, m3 = row
+        clicks_monthly.append({
+            "sku_group": sku_group, "month": month, "clicks": float(clicks_val or 0),
+            "l1": l1, "cat": cat, "m1": m1, "m2": m2, "m3": m3,
+        })
+    print(f"  -> {len(clicks_monthly)} clicks_monthly rows from Snowflake")
+    return clicks_monthly
+
+
+# ---------------------------------------------------------------------------
 # Snowflake: daily-grain actual Returns (RETURNS_DATA), joined to the product
 # master (meta_mapping_cogs_sku) to get L1/Category/Meta1/2/3 per SKU_GROUP,
 # for the new Analytics tab's "Returns" metric (actual, not the learned/frozen
@@ -665,17 +1370,96 @@ def build_new_totals():
     return totals
 
 
-def build_targets():
-    """New target logic: preserves the OLD channel-mix % (from the 4
-    Planned_Qty_only files) and applies it to the NEW total (from
-    data/targets_new_total.xlsx), per L1 x Category x Month. The old files
-    are now used only to derive the split ratio, not as target values
-    themselves -- the new file's totals are authoritative."""
+def compute_return_rates(returns_actual):
+    """Per (channel, l1, cat) return rate as a %, aggregated across all
+    dates/metas in returns_actual (Snowflake-derived, real data) -- used to
+    gross up the V3 target file's net figures. Capped at the same business
+    ceilings as the live dashboard's Returns tab (Marketplace <=45%, Shopify
+    <=30%, Offline fixed 0%), so a sparse/noisy computed rate can't produce
+    an unreasonable gross-up."""
+    totals = {}  # (channel, l1_lower, cat_lower) -> {"sales": x, "returns": y}
+    for r in returns_actual:
+        l1_key = (r["l1"] or "").strip().lower()
+        cat_key = (r["cat"] or "").strip().lower()
+        key = (r["channel"], l1_key, cat_key)
+        t = totals.setdefault(key, {"sales": 0.0, "returns": 0.0})
+        t["sales"] += r.get("sales_qty", 0) or 0
+        t["returns"] += r.get("return_qty", 0) or 0
+
+    rates = {}
+    for (channel, l1_key, cat_key), t in totals.items():
+        cap = RETURN_RATE_CAPS.get(channel)
+        if cap == 0:
+            rates[(channel, l1_key, cat_key)] = 0.0
+            continue
+        pct = (t["returns"] / t["sales"] * 100) if t["sales"] > 0 else 0.0
+        if cap is not None:
+            pct = min(pct, cap)
+        rates[(channel, l1_key, cat_key)] = pct
+    return rates
+
+
+def build_targets_v3(return_rates):
+    """Reads data/Target_V3.xlsx -- direct Channel x L1 x Category x
+    Meta1/2/3 x Month NET qty targets for Sep-Dec 2026 -- and grosses each
+    figure up using compute_return_rates() so it's consistent with how the
+    rest of the pipeline treats targets (gross, netted client-side same as
+    Sales). Falls back to the net figure unchanged (0% assumed) if no return
+    rate is available for that (channel, l1, cat) combo, matching the same
+    "don't fabricate a number" policy used elsewhere in this script."""
+    if not os.path.exists(TARGET_V3_FILE):
+        print("NOTE: data/Target_V3.xlsx not found -- Sep-Dec targets will use the old total-file approach.")
+        return []
+
+    wb = openpyxl.load_workbook(TARGET_V3_FILE, data_only=True, read_only=True)
+    ws = wb["Sheet1"]
+    targets = []
+    skipped_no_rate = 0
+    for row in ws.iter_rows(min_row=5, values_only=True):
+        if not row or row[0] is None:
+            continue
+        l1_raw, cat_raw = row[0], row[1]
+        if str(l1_raw).strip().lower() == "grand total":
+            continue
+        l1 = str(l1_raw).strip()
+        cat = str(cat_raw).strip().lower() if cat_raw else None
+        m1 = row[2] if row[2] and str(row[2]).strip().lower() != "unmapped" else None
+        m2 = row[3] if row[3] and str(row[3]).strip().lower() != "unmapped" else None
+        m3 = row[4] if row[4] and str(row[4]).strip().lower() != "unmapped" else None
+
+        for col_idx_1based, (channel, month) in TARGET_V3_QTY_COLS.items():
+            net_qty = row[col_idx_1based - 1]
+            if not net_qty:
+                continue
+            rate = return_rates.get((channel, l1.lower(), cat))
+            if rate is None:
+                gross_qty = net_qty  # no return data for this combo -- 0% assumed, not fabricated
+                skipped_no_rate += 1
+            else:
+                gross_qty = net_qty / (1 - rate / 100) if rate < 100 else net_qty
+            targets.append({
+                "channel": channel, "l1": l1, "cat": cat, "m1": m1, "m2": m2, "m3": m3,
+                "month": month, "qty": gross_qty,
+            })
+    wb.close()
+    print(f"  -> {len(targets)} V3 target rows (Sep-Dec, gross-adjusted); "
+          f"{skipped_no_rate} had no return-rate match (used net as-is, 0% assumed).")
+    return targets
+
+
+def build_targets_old_approach():
+    """Old approach: preserves the channel-mix % (from the 4 Planned_Qty_only
+    files) and applies it to the total (from data/targets_new_total.xlsx), per
+    L1 x Category x Month. Now used ONLY for August -- the new Target_V3.xlsx
+    (see build_targets_v3) covers Sep-Dec directly with real channel+meta
+    splits and doesn't need this proration at all for those months."""
     pct = build_channel_mix_pct()
     new_totals = build_new_totals()
 
     targets = []
     for (l1, cat, month), new_total in new_totals.items():
+        if month != "2026-08":
+            continue  # V3 file is authoritative for Sep-Dec now
         matching_channels = [k for k in pct if k[0] == l1 and k[1] == cat and k[3] == month]
         if not matching_channels:
             continue  # no old channel-mix data for this L1+Cat+Month -- can't split honestly
@@ -684,6 +1468,17 @@ def build_targets():
             share = pct[key]
             targets.append({"channel": channel, "l1": l1, "cat": cat, "month": month, "qty": new_total * share})
     return targets
+
+
+def build_targets(returns_actual):
+    """Combines both target sources: the old proration approach for August
+    (2026-08, not covered by the new file), and the new Target_V3.xlsx direct
+    channel+meta split for Sep-Dec (gross-adjusted from its native net figures
+    using real return rates -- see build_targets_v3)."""
+    return_rates = compute_return_rates(returns_actual)
+    aug_targets = build_targets_old_approach()
+    v3_targets = build_targets_v3(return_rates)
+    return aug_targets + v3_targets
 
 
 def build(xlsx_path_or_workbook):
@@ -698,6 +1493,9 @@ def build(xlsx_path_or_workbook):
     returns_by_sku = fetch_returns_by_sku_from_snowflake()
     returns_actual = fetch_returns_from_snowflake()
     images = fetch_images_from_snowflake()
+    live_sku_groups = fetch_live_sku_groups_from_snowflake()
+    clicks = fetch_clicks_from_snowflake()
+    clicks_monthly = fetch_clicks_monthly_from_snowflake()
 
     # ---- Inventory ----
     # Kept at DAILY grain (not summed to month) because Closing(month) = the
@@ -745,7 +1543,7 @@ def build(xlsx_path_or_workbook):
             "cogs_value": qty * (cogs_unit or 0)
         })
 
-    targets = build_targets()
+    targets = build_targets(returns_actual)
     returns = build_returns()
 
     og_path = os.path.join(HERE, "data", "targets_og_fallback.json")
@@ -775,6 +1573,8 @@ def build(xlsx_path_or_workbook):
         "inventory.json": {"inventory": inventory},
         "pipeline.json": {"pipeline": pipeline},
         "returns_actual.json": {"returns_actual": returns_actual},
+        "livesku.json": {"live_sku_groups": live_sku_groups},
+        "clicks.json": {"clicks": clicks, "clicks_monthly": clicks_monthly},
         "targets.json": {
             "targets": targets,        # primary source: the 4 category files, multi-channel
             "targets_og": targets_og,  # fallback: old Targets tab, Shopify-only, all categories
@@ -792,7 +1592,8 @@ def build(xlsx_path_or_workbook):
     print(f"sales rows: {len(sales)}, sales_by_sku rows: {len(sales_by_sku)}, returns_by_sku rows: {len(returns_by_sku)}, "
           f"inventory rows: {len(inventory)}, pipeline rows: {len(pipeline)}, "
           f"target rows (new files): {len(targets)}, target rows (OG fallback): {len(targets_og)}, "
-          f"returns_actual rows: {len(returns_actual)}, images: {len(images)}")
+          f"returns_actual rows: {len(returns_actual)}, images: {len(images)}, live_sku_groups rows: {len(live_sku_groups)}, "
+          f"clicks rows: {len(clicks)}, clicks_monthly rows: {len(clicks_monthly)}")
     if len(sales) > 0 and len(inventory) == 0:
         print("\n⚠️  WARNING: Sales has rows but Inventory is empty. This is the exact symptom")
         print("   of an unauthenticated download failing to resolve IMPORTRANGE on Inv Data 2.")
