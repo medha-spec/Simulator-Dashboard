@@ -47,7 +47,8 @@
 
   main{ padding:24px 32px 60px; max-width:1800px; margin:0 auto; }
 
-  .kpi-row{ display:grid; grid-template-columns:repeat(5, 1fr); gap:12px; margin-bottom:30px; }
+  .kpi-row{ display:grid; grid-template-columns:repeat(6, 1fr); gap:12px; margin-bottom:30px; }
+  @media(max-width:1200px){ .kpi-row{ grid-template-columns:repeat(3,1fr);} }
   @media(max-width:1000px){ .kpi-row{ grid-template-columns:repeat(2,1fr);} }
   .kpi{ background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; position:relative; overflow:hidden; }
   .kpi::before{ content:''; position:absolute; left:0; top:0; bottom:0; width:3px; background:var(--amber-dim); }
@@ -549,9 +550,8 @@ function targetLCFromOG(l1, cat, month){
   return sum;
 }
 function targetLC(channelFilter, l1, cat, month){
-  if (NEW_FILE_CATS.has(cat)){
-    return targetLCFromNewSource(channelFilter, l1, cat, month);
-  }
+  const fromNew = targetLCFromNewSource(channelFilter, l1, cat, month);
+  if (fromNew !== null) return fromNew;
   if (channelFilter === 'ALL' || channelFilter === 'Shopify'){
     return targetLCFromOG(l1, cat, month);
   }
@@ -1082,6 +1082,31 @@ function renderTracking(sales, leafKeys, f, qtyField, valField){
 //   Opening(m)    = real snapshot within m, if one exists; else Closing(m-1)
 //   Sales Left(m) = MAX(0, Target(m) - Actual(m))
 //   Closing(m)    = Opening(m) + Inwards(m) - Sales Left(m)
+// Resolves the date to treat as a given month's "closing snapshot date" for
+// DOI(L30D): the actual latest data date if m is the current (partial) month,
+// the calendar month-end if m is a fully-past month, or null if m is a future
+// month with no real closing data yet at all (never simulated for this metric).
+function monthAsOfDate(m){
+  const cur = currentMonthKey();
+  if (m > cur) return null;
+  if (m === cur) return latestDataDate();
+  const [y, mm] = m.split('-').map(Number);
+  const lastDay = new Date(Date.UTC(y, mm, 0)).getUTCDate();
+  return `${m}-${String(lastDay).padStart(2,'0')}`;
+}
+// Sums salesRows' valKey field over the 30 days ending (inclusive) at asOfDate.
+// NOTE: salesRows here come from the already MONTHS-filtered `sales` array
+// (Aug-Dec 2026 per the current dashboard window) -- fine today since every
+// trailing-30-day window needed falls inside that range, but if MONTHS is
+// ever narrowed to start later in the year this could under-count near the
+// start of that window. Flagging so it's not a silent surprise later.
+function trailing30SalesAt(salesRows, asOfDate, valKey){
+  const start = isoAddDays(asOfDate, -29);
+  let sum = 0;
+  salesRows.forEach(r => { if (r.date && r.date >= start && r.date <= asOfDate) sum += (r[valKey] || 0); });
+  return sum;
+}
+
 function computeLedger(entity, f, qtyField, valField){
   const valKey = metric === 'qty' ? 'qty' : 'cogs_sold';
   function realSnapshotAt(m){
@@ -1100,6 +1125,7 @@ function computeLedger(entity, f, qtyField, valField){
   function inwardsAt(m){ return entity.leafKeys.reduce((a,lk) => a + inwardsForLeaf(lk, m), 0); }
 
   const opening = [], closing = [], salesLeft = [], target = [], actual = [], inwards = [];
+  const doiL30D = [], doiL30D_closing = [], doiL30D_l30dQty = [];
   for (let i = 0; i < MONTHS.length; i++){
     const m = MONTHS[i];
     target.push(targetAt(m));
@@ -1116,8 +1142,24 @@ function computeLedger(entity, f, qtyField, valField){
 
     const closeVal = (openVal !== null && slVal !== null) ? (openVal + inwards[i] - slVal) : null;
     closing.push(closeVal);
+
+    // DOI(L30D): real closing snapshot at this month's "as-of" date, divided
+    // by that trailing-30-day sales rate. Only populated where a REAL closing
+    // snapshot exists (real !== null) -- never against the simulated future
+    // `closing` array above, and never fabricated for months with no data yet.
+    const asOf = monthAsOfDate(m);
+    if (real !== null && asOf !== null){
+      const l30dQty = trailing30SalesAt(entity.salesRows, asOf, valKey);
+      doiL30D.push(l30dQty > 0 ? (real * 30 / l30dQty) : null);
+      doiL30D_closing.push(real);
+      doiL30D_l30dQty.push(l30dQty);
+    } else {
+      doiL30D.push(null);
+      doiL30D_closing.push(null);
+      doiL30D_l30dQty.push(null);
+    }
   }
-  return { opening, closing, salesLeft, target, actual, inwards };
+  return { opening, closing, salesLeft, target, actual, inwards, doiL30D, doiL30D_closing, doiL30D_l30dQty };
 }
 
 function renderKPIs(sales, leafKeys, qtyField, valField, f){
@@ -1138,6 +1180,13 @@ function renderKPIs(sales, leafKeys, qtyField, valField, f){
   const doi = (closingQty !== null && targetAtLastMonth) ? (closingQty * 30 / targetAtLastMonth) : null;
   const gm = salesGross ? ((salesGross - salesCogs) / salesGross * 100) : null;
 
+  // DOI(L30D): last available real (non-simulated) value in the ledger --
+  // i.e. whichever month currently has a real closing snapshot most recently
+  // (the current partial month, in practice).
+  let doiL30DIdx = -1;
+  for (let i = 0; i < MONTHS.length; i++){ if (ledger.doiL30D[i] !== null) doiL30DIdx = i; }
+  const doiL30D = doiL30DIdx >= 0 ? ledger.doiL30D[doiL30DIdx] : null;
+
   const kpis = [
     {label:'Sales Qty (Aug–Dec)', value: fmtNum(salesQty), sub: sales.length+' line items'},
     {label:'Sales COGS Value', value: '₹'+fmtNum(salesCogs), sub: 'gross ₹'+fmtNum(salesGross)},
@@ -1145,6 +1194,7 @@ function renderKPIs(sales, leafKeys, qtyField, valField, f){
      sub: anyTarget ? fmtNum(totalTarget)+' units target' : 'no target for this slice yet'},
     {label:'Closing (simulated)', value: closingQty!==null ? fmtNum(closingQty)+' u' : '—', sub: lastMonthIdx>=0 ? 'as of '+MONTH_LABEL[MONTHS[lastMonthIdx]] : 'no data yet'},
     {label:'DOI (Closing/Target×30)', value: doi!==null ? doi.toFixed(0)+'d' : '—', sub: gm!==null ? 'GM '+gm.toFixed(1)+'%' : ''},
+    {label:'DOI (L30D actual rate)', value: doiL30D!==null ? doiL30D.toFixed(0)+'d' : '—', sub: doiL30DIdx>=0 ? 'as of '+MONTH_LABEL[MONTHS[doiL30DIdx]]+', real closing' : 'no real closing yet'},
   ];
   document.getElementById('kpi-row').innerHTML = kpis.map(k =>
     `<div class="kpi"><div class="label">${k.label}</div><div class="value">${k.value}</div><div class="sub">${k.sub}</div></div>`
@@ -1162,6 +1212,7 @@ const DASHBOARD_BLOCKS = [
   {key:'inwards', title:'Inwards'},
   {key:'closing', title:'Closing (simulated)'},
   {key:'doi', title:'DOI (Closing/Target×30)', note:true, isDoi:true},
+  {key:'doiL30D', title:'DOI (L30D actual sales rate)', note:true, isDoiL30D:true},
 ];
 const TRACKING_BLOCKS = [
   {key:'target', title:'Sales Target (Full Month)', note:true},
@@ -1245,6 +1296,11 @@ function renderCellForBlock(blockDef, ledger, i){
     const doi = c*30/t;
     return `<td class="doi-cell"><span class="doi-chip ${doiClass(doi)}">${doi.toFixed(0)}d</span></td>`;
   }
+  if (blockDef.isDoiL30D){
+    const doi = ledger.doiL30D[i];
+    if (doi===null||doi===undefined) return `<td class="doi-cell"><span class="doi-chip doi-none">—</span></td>`;
+    return `<td class="doi-cell"><span class="doi-chip ${doiClass(doi)}">${doi.toFixed(0)}d</span></td>`;
+  }
   const v = ledger[blockDef.key][i];
   if (blockDef.isDelta){
     if (v===null||v===undefined) return `<td class="dash">—</td>`;
@@ -1278,6 +1334,16 @@ function computeTotal(rows, ledgers, blockDef, monthIndex){
     });
     if (!any || !targetSum) return null;
     return closingSum * 30 / targetSum;
+  }
+  if (blockDef.isDoiL30D){
+    let closingSum = 0, l30dSum = 0, any = false;
+    rows.forEach(r => {
+      const l = ledgers.get(r);
+      if (l.doiL30D_closing[monthIndex] !== null){ closingSum += l.doiL30D_closing[monthIndex]; any = true; }
+      if (l.doiL30D_l30dQty[monthIndex] !== null){ l30dSum += l.doiL30D_l30dQty[monthIndex]; }
+    });
+    if (!any || !l30dSum) return null;
+    return closingSum * 30 / l30dSum;
   }
   if (blockDef.isPercent){
     // Recompute from underlying actual/till-date-target sums, not an average of %s.
@@ -1315,7 +1381,7 @@ function pivotBlockV2(blockDef, rows, def, ledgers, cardId, sortSpec){
   const totalCells = MONTHS.map((m,i) => {
     const t = computeTotal(rows, ledgers, blockDef, i);
     if (t === null || t === undefined) return `<td class="dash">—</td>`;
-    if (blockDef.isDoi) return `<td><span class="doi-chip ${doiClass(t)}">${t.toFixed(0)}d</span></td>`;
+    if (blockDef.isDoi || blockDef.isDoiL30D) return `<td><span class="doi-chip ${doiClass(t)}">${t.toFixed(0)}d</span></td>`;
     if (blockDef.isDelta){
       const cls = t>0?'delta-behind':(t<0?'delta-ahead':'');
       return `<td class="${cls}">${t>0?'+':''}${fmtNum(t)}</td>`;
@@ -1901,7 +1967,7 @@ function renderAnalyticsTab(){
         const invert = metricId === 'returns' || metricId === 'doi';
         const isGood = invert ? cell.pctChange < 0 : cell.pctChange > 0;
         const isBad = invert ? cell.pctChange > 0 : cell.pctChange < 0;
-        const intensity = Math.min(Math.abs(cell.pctChange) / 50, 1); // caps at ±50% change
+        const intensity = Math.min(Math.abs(cell.pctChange) / 50, 1); // caps at ┬▒50% change
         if (isGood){ bg = `rgba(111,163,131,${(0.10 + intensity*0.35).toFixed(2)})`; color = 'var(--green)'; }
         else if (isBad){ bg = `rgba(193,89,74,${(0.10 + intensity*0.35).toFixed(2)})`; color = 'var(--red)'; }
       }
