@@ -87,6 +87,29 @@ TARGET_CHANNEL_MAP = {"Online - Shopify": "Shopify"}
 
 NEW_TOTAL_FILE = os.path.join(HERE, "data", "targets_new_total.xlsx")
 
+# V3 target file: direct Channel x L1 x Category x Meta1/2/3 x Month qty
+# targets for Sep-Dec 2026 (no Aug -- that month's already happened by the time
+# this file was built). Unlike the old approach (aggregate 4 category files +
+# apply channel-mix % to a separate all-channel total), this file already has
+# the exact channel split AND meta-level granularity built in -- no proration
+# needed. Covers ALL ~55 categories, not just the previous 4.
+TARGET_V3_FILE = os.path.join(HERE, "data", "Target_V3.xlsx")
+TARGET_V3_QTY_COLS = {
+    # column letter (1-indexed) -> (channel, month)
+    17: ("Shopify", "2026-09"), 18: ("Marketplace", "2026-09"), 19: ("Offline", "2026-09"),
+    20: ("Shopify", "2026-10"), 21: ("Marketplace", "2026-10"), 22: ("Offline", "2026-10"),
+    23: ("Shopify", "2026-11"), 24: ("Marketplace", "2026-11"), 25: ("Offline", "2026-11"),
+    26: ("Shopify", "2026-12"), 27: ("Marketplace", "2026-12"), 28: ("Offline", "2026-12"),
+}
+# The V3 file's Qty figures are NET (post-returns), but the rest of the
+# pipeline (and the dashboard's Net/Gross toggle) expects targets to be GROSS,
+# consistently with how Sales is stored gross and netted-down client-side.
+# We gross these up using real return rates computed from returns_actual
+# (Snowflake), capped at the same business-policy ceilings enforced elsewhere
+# in the app (see RETURN_CAPS in index.html) so a noisy/sparse rate can't
+# produce an absurd gross-up.
+RETURN_RATE_CAPS = {"Marketplace": 45, "Shopify": 30, "Offline": 0}
+
 
 # ---------------------------------------------------------------------------
 # Mode A: Google Sheets API via service account (authenticated, IMPORTRANGE-safe)
@@ -2284,17 +2307,96 @@ def build_new_totals():
     return totals
 
 
-def build_targets():
-    """New target logic: preserves the OLD channel-mix % (from the 4
-    Planned_Qty_only files) and applies it to the NEW total (from
-    data/targets_new_total.xlsx), per L1 x Category x Month. The old files
-    are now used only to derive the split ratio, not as target values
-    themselves -- the new file's totals are authoritative."""
+def compute_return_rates(returns_actual):
+    """Per (channel, l1, cat) return rate as a %, aggregated across all
+    dates/metas in returns_actual (Snowflake-derived, real data) -- used to
+    gross up the V3 target file's net figures. Capped at the same business
+    ceilings as the live dashboard's Returns tab (Marketplace <=45%, Shopify
+    <=30%, Offline fixed 0%), so a sparse/noisy computed rate can't produce
+    an unreasonable gross-up."""
+    totals = {}  # (channel, l1_lower, cat_lower) -> {"sales": x, "returns": y}
+    for r in returns_actual:
+        l1_key = (r["l1"] or "").strip().lower()
+        cat_key = (r["cat"] or "").strip().lower()
+        key = (r["channel"], l1_key, cat_key)
+        t = totals.setdefault(key, {"sales": 0.0, "returns": 0.0})
+        t["sales"] += r.get("sales_qty", 0) or 0
+        t["returns"] += r.get("return_qty", 0) or 0
+
+    rates = {}
+    for (channel, l1_key, cat_key), t in totals.items():
+        cap = RETURN_RATE_CAPS.get(channel)
+        if cap == 0:
+            rates[(channel, l1_key, cat_key)] = 0.0
+            continue
+        pct = (t["returns"] / t["sales"] * 100) if t["sales"] > 0 else 0.0
+        if cap is not None:
+            pct = min(pct, cap)
+        rates[(channel, l1_key, cat_key)] = pct
+    return rates
+
+
+def build_targets_v3(return_rates):
+    """Reads data/Target_V3.xlsx -- direct Channel x L1 x Category x
+    Meta1/2/3 x Month NET qty targets for Sep-Dec 2026 -- and grosses each
+    figure up using compute_return_rates() so it's consistent with how the
+    rest of the pipeline treats targets (gross, netted client-side same as
+    Sales). Falls back to the net figure unchanged (0% assumed) if no return
+    rate is available for that (channel, l1, cat) combo, matching the same
+    "don't fabricate a number" policy used elsewhere in this script."""
+    if not os.path.exists(TARGET_V3_FILE):
+        print("NOTE: data/Target_V3.xlsx not found -- Sep-Dec targets will use the old total-file approach.")
+        return []
+
+    wb = openpyxl.load_workbook(TARGET_V3_FILE, data_only=True, read_only=True)
+    ws = wb["Sheet1"]
+    targets = []
+    skipped_no_rate = 0
+    for row in ws.iter_rows(min_row=5, values_only=True):
+        if not row or row[0] is None:
+            continue
+        l1_raw, cat_raw = row[0], row[1]
+        if str(l1_raw).strip().lower() == "grand total":
+            continue
+        l1 = str(l1_raw).strip()
+        cat = str(cat_raw).strip().lower() if cat_raw else None
+        m1 = row[2] if row[2] and str(row[2]).strip().lower() != "unmapped" else None
+        m2 = row[3] if row[3] and str(row[3]).strip().lower() != "unmapped" else None
+        m3 = row[4] if row[4] and str(row[4]).strip().lower() != "unmapped" else None
+
+        for col_idx_1based, (channel, month) in TARGET_V3_QTY_COLS.items():
+            net_qty = row[col_idx_1based - 1]
+            if not net_qty:
+                continue
+            rate = return_rates.get((channel, l1.lower(), cat))
+            if rate is None:
+                gross_qty = net_qty  # no return data for this combo -- 0% assumed, not fabricated
+                skipped_no_rate += 1
+            else:
+                gross_qty = net_qty / (1 - rate / 100) if rate < 100 else net_qty
+            targets.append({
+                "channel": channel, "l1": l1, "cat": cat, "m1": m1, "m2": m2, "m3": m3,
+                "month": month, "qty": gross_qty,
+            })
+    wb.close()
+    print(f"  -> {len(targets)} V3 target rows (Sep-Dec, gross-adjusted); "
+          f"{skipped_no_rate} had no return-rate match (used net as-is, 0% assumed).")
+    return targets
+
+
+def build_targets_old_approach():
+    """Old approach: preserves the channel-mix % (from the 4 Planned_Qty_only
+    files) and applies it to the total (from data/targets_new_total.xlsx), per
+    L1 x Category x Month. Now used ONLY for August -- the new Target_V3.xlsx
+    (see build_targets_v3) covers Sep-Dec directly with real channel+meta
+    splits and doesn't need this proration at all for those months."""
     pct = build_channel_mix_pct()
     new_totals = build_new_totals()
 
     targets = []
     for (l1, cat, month), new_total in new_totals.items():
+        if month != "2026-08":
+            continue  # V3 file is authoritative for Sep-Dec now
         matching_channels = [k for k in pct if k[0] == l1 and k[1] == cat and k[3] == month]
         if not matching_channels:
             continue  # no old channel-mix data for this L1+Cat+Month -- can't split honestly
@@ -2303,6 +2405,17 @@ def build_targets():
             share = pct[key]
             targets.append({"channel": channel, "l1": l1, "cat": cat, "month": month, "qty": new_total * share})
     return targets
+
+
+def build_targets(returns_actual):
+    """Combines both target sources: the old proration approach for August
+    (2026-08, not covered by the new file), and the new Target_V3.xlsx direct
+    channel+meta split for Sep-Dec (gross-adjusted from its native net figures
+    using real return rates -- see build_targets_v3)."""
+    return_rates = compute_return_rates(returns_actual)
+    aug_targets = build_targets_old_approach()
+    v3_targets = build_targets_v3(return_rates)
+    return aug_targets + v3_targets
 
 
 def build(xlsx_path_or_workbook):
@@ -2370,7 +2483,7 @@ def build(xlsx_path_or_workbook):
             "cogs_value": qty * (cogs_unit or 0)
         })
 
-    targets = build_targets()
+    targets = build_targets(returns_actual)
     returns = build_returns()
 
     og_path = os.path.join(HERE, "data", "targets_og_fallback.json")

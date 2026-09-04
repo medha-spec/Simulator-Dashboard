@@ -1,5 +1,4 @@
 name: Refresh Dashboard Data
-
 # Runs automatically every day at 10:00 AM IST, and can also be triggered
 # manually from the Actions tab (Run workflow button) whenever you want an
 # on-demand refresh.
@@ -7,38 +6,37 @@ on:
   schedule:
     - cron: '30 4 * * *'   # 04:30 UTC = 10:00 AM IST
   workflow_dispatch:
-
 permissions:
-  contents: write   # needed so this workflow can commit the refreshed data.json back
-
+  contents: write   # needed so this workflow can commit the refreshed data files back
 jobs:
   refresh:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Install dependencies
-        run: pip install openpyxl google-api-python-client google-auth
-
+        run: pip install openpyxl google-api-python-client google-auth snowflake-connector-python
       - name: Write service account credentials
         run: echo '${{ secrets.GSHEET_SERVICE_ACCOUNT_JSON }}' > service_account.json
-
-      - name: Rebuild data.json from the live Google Sheet
+      - name: Rebuild data files from Snowflake + the live Google Sheet
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+          SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
         run: python build_data.py
-
       - name: Remove credentials before committing
         run: rm -f service_account.json
-
-      - name: Commit and push data.json if it changed
+      - name: Commit and push data files if they changed
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/data.json
+          git add data/*.json
           git diff --staged --quiet || git commit -m "Automated data refresh $(date -u +'%Y-%m-%d %H:%M UTC')"
           git push
