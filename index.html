@@ -80,7 +80,33 @@
   .ptable td.dash{ color:var(--text-faint); }
   .ptable td.delta-behind{ color:var(--red); }
   .ptable td.delta-ahead{ color:var(--green); }
+  .ptable tr.overall-row{ background:rgba(232,163,61,0.12); }
+  .ptable tr.overall-row td{ font-weight:600; }
+  .ptable tr.overall-row td.rowlabel{ color:var(--amber); }
   .sortable-th{ cursor:pointer; user-select:none; }
+
+  /* Sales vs Inwards: cream/black theme, distinct from the rest of the (dark) app */
+  .svi-table{ border-collapse:collapse; background:#F5EFE0; color:#1a1a1a; }
+  .svi-table th, .svi-table td{ padding:6px 9px; text-align:center; vertical-align:middle;
+    font-family:'IBM Plex Mono', monospace; font-size:12px; border:1px solid #DCD2B4; white-space:nowrap; }
+  .svi-table thead th{ background:#EAE0BE; font-weight:600; text-transform:uppercase; font-size:10px; letter-spacing:0.05em;
+    position:sticky; top:0; z-index:3; }
+  .svi-table thead tr + tr th{ top:30px; } /* only a real 2nd header row shifts down -- a lone row stays at top:0 */
+  .svi-table td.rowlabel{ font-family:'Inter'; font-weight:500; text-align:center; }
+  .svi-table td.dash{ color:#8a8065; }
+  .svi-table .svi-sticky{ position:sticky; background:#F5EFE0; z-index:2; }
+  .svi-table thead .svi-sticky{ background:#EAE0BE; z-index:4; top:0; }
+  .svi-table td.delta-behind{ color:var(--red); }
+  .svi-table td.delta-ahead{ color:var(--green); }
+  .svi-table tr.overall-row{ background:rgba(232,163,61,0.18); }
+  .svi-table tr.overall-row td{ font-weight:600; }
+  .svi-table tr.overall-row td.rowlabel{ color:#8a5a00; }
+  .svi-table .svi-block-end{ border-right:3px solid #B8AA7A; }
+  .svi-table td.svi-top3{ background:#BFE3C2; color:#0F4C1F; font-weight:700; }
+  .svi-table tr.svi-fit-total td{ font-weight:700; background:#E7DCAE; }
+  .svi-table tr.svi-fit-total td.svi-sticky{ background:#E7DCAE; }
+  .svi-table tr.svi-cat-total td{ font-weight:700; background:#D6C583; }
+  .svi-table tr.svi-cat-total td.svi-sticky{ background:#D6C583; }
   .sortable-th:hover{ color:var(--amber); }
   .total-row td{ font-weight:600; border-top:2px solid var(--line); background:var(--panel-2); color:var(--text); }
   .total-row td.total-label{ color:var(--amber); }
@@ -176,6 +202,9 @@
     <button data-page="quartile">QUARTILE</button>
     <button data-page="livesku">LIVE SKU GROUPS</button>
     <button data-page="clicks">CLICKS</button>
+    <button data-page="storecutsize">STORE CUT SIZE</button>
+    <button data-page="salesvsinwards">SALES VS INWARDS</button>
+    <button data-page="storereturns">STORE RETURNS</button>
   </div>
   <div class="active-path" id="active-path"></div>
 </div>
@@ -209,6 +238,15 @@
   <div id="page-clicks" style="display:none;">
     <div id="clicks-root"></div>
   </div>
+  <div id="page-storecutsize" style="display:none;">
+    <div id="storecutsize-root"></div>
+  </div>
+  <div id="page-salesvsinwards" style="display:none;">
+    <div id="salesvsinwards-root"></div>
+  </div>
+  <div id="page-storereturns" style="display:none;">
+    <div id="storereturns-root"></div>
+  </div>
 </main>
 
 <div class="img-lightbox" id="img-lightbox" onclick="closeLightbox()">
@@ -229,6 +267,7 @@ let pipelineIndex = {};    // leafKey -> array of pipeline records
 let allLeafKeysByLC = {};  // "l1||cat" -> [leafKeys...] across the WHOLE dataset (for proration denominator)
 let metric = 'qty';
 let currentPage = 'dashboard';
+let storeCutSizeCluster = 'ALL';
 
 const MONTHS = ['2026-08','2026-09','2026-10','2026-11','2026-12'];
 const PREV_MONTH = {'2026-08':'2026-07','2026-09':'2026-08','2026-10':'2026-09','2026-11':'2026-10','2026-12':'2026-11'};
@@ -264,7 +303,7 @@ function currentMonthKey(){
 const DATA_PARTS = [
   'data/meta.json', 'data/sales.json', 'data/sales_by_sku.json',
   'data/inventory.json', 'data/pipeline.json', 'data/returns_actual.json', 'data/targets.json',
-  'data/livesku.json', 'data/clicks.json'
+  'data/livesku.json', 'data/clicks.json', 'data/storecutsize.json', 'data/salesvsinwards.json', 'data/storereturns.json'
 ];
 
 Promise.all(DATA_PARTS.map(url => fetch(url).then(r => {
@@ -438,6 +477,9 @@ function populateFilters(){
       document.getElementById('page-quartile').style.display = currentPage === 'quartile' ? '' : 'none';
       document.getElementById('page-livesku').style.display = currentPage === 'livesku' ? '' : 'none';
       document.getElementById('page-clicks').style.display = currentPage === 'clicks' ? '' : 'none';
+      document.getElementById('page-storecutsize').style.display = currentPage === 'storecutsize' ? '' : 'none';
+      document.getElementById('page-salesvsinwards').style.display = currentPage === 'salesvsinwards' ? '' : 'none';
+      document.getElementById('page-storereturns').style.display = currentPage === 'storereturns' ? '' : 'none';
       render();
     });
   });
@@ -658,6 +700,18 @@ function render(){
   }
   if (currentPage === 'clicks'){
     renderClicksTab(f);
+    return;
+  }
+  if (currentPage === 'storecutsize'){
+    renderStoreCutSizeTab(f);
+    return;
+  }
+  if (currentPage === 'salesvsinwards'){
+    renderSalesVsInwardsTab(f);
+    return;
+  }
+  if (currentPage === 'storereturns'){
+    renderStoreReturnsTab(f);
     return;
   }
   renderKPIs(sales, leafKeysMatchingFilter, qtyField, valField, f);
@@ -927,21 +981,38 @@ function clicksThumb(r){
     : `<span class="sku-thumb-placeholder sku-thumb-placeholder-lg"></span>`;
 }
 
-const CLICKS_TABLE_HEADER = `<th>SKU Group</th><th>Live Date</th><th>L1</th><th>Meta 1</th><th>Meta 2</th><th>Meta 3</th><th>WH Inv</th>
-  <th>Clicks 1-15</th><th>Clicks 15-30</th><th>Last 30 Days</th><th>Image Link</th><th>Image</th>`;
+const CLICKS_TABLE_HEADER = `<th>SKU Group</th><th>Live Date</th><th>L1</th><th>Category</th><th>Meta 1</th><th>Meta 2</th><th>Meta 3</th><th>WH Inv</th>
+  <th>Sets Available</th><th>Store Count</th><th>Total Store Inv</th>
+  <th>Clicks 1-15</th><th>Clicks 15-30</th><th>Last 30 Days</th>
+  <th>Total Sales</th><th>Retail Sales</th><th>Shopify Sales</th><th>MP Sales</th>
+  <th>Overall DOI</th><th>Retail DOI</th><th>Shopify DOI</th><th>MP DOI</th>
+  <th>Image Link</th><th>Image</th>`;
 function clicksRowHTML(r){
   const link = r.image_url ? `<a href="${r.image_url}" target="_blank" rel="noopener">Link</a>` : '—';
+  const n = (v) => fmtNum(v) ?? '—';
   return `<tr>
     <td class="rowlabel">${r.sku_group}</td>
     <td>${fmtDMY(r.live_date) || '—'}</td>
     <td>${r.l1 || '—'}</td>
+    <td>${r.cat || '—'}</td>
     <td>${r.m1 || '—'}</td>
     <td>${r.m2 || '—'}</td>
     <td>${r.m3 || '—'}</td>
-    <td>${fmtNum(r.wh_qty)}</td>
-    <td>${fmtNum(r.clicks_1_15)}</td>
-    <td>${fmtNum(r.clicks_15_30)}</td>
-    <td>${fmtNum(r.clicks_last_30)}</td>
+    <td>${n(r.wh_qty)}</td>
+    <td>${n(r.sets_available)}</td>
+    <td>${n(r.store_count)}</td>
+    <td>${n(r.total_store_inventory)}</td>
+    <td>${n(r.clicks_1_15)}</td>
+    <td>${n(r.clicks_15_30)}</td>
+    <td>${n(r.clicks_last_30)}</td>
+    <td>${n(r.ttl_sales)}</td>
+    <td>${n(r.retail_sales)}</td>
+    <td>${n(r.shopify_sales)}</td>
+    <td>${n(r.mp_sales)}</td>
+    <td>${n(r.overall_doi)}</td>
+    <td>${n(r.retail_doi)}</td>
+    <td>${n(r.shopify_doi)}</td>
+    <td>${n(r.mp_doi)}</td>
     <td>${link}</td>
     <td>${clicksThumb(r)}</td>
   </tr>`;
@@ -970,6 +1041,641 @@ function renderClicksTab(f){
   }).join('');
 
   document.getElementById('clicks-root').innerHTML = trendSection + sections;
+}
+
+// Same long_tail exclusion as the other two tabs -- source data spells it
+// "long_tail", not "Long Tail", so the query's own NOT IN ('LONG TAIL')
+// filter doesn't actually catch it; done here instead. Also drops rows with
+// no category, including the literal string "(nil)" some rows carry.
+function storeCutSizeExcluded(r){
+  const l1 = (r.l1 || '').trim().toUpperCase().replace(/_/g, ' ');
+  if (l1 === '' || l1 === 'LONG TAIL') return true;
+  const cat = (r.cat || '').trim().toUpperCase();
+  if (cat === '' || cat === '(NIL)') return true;
+  return false;
+}
+
+// Total unique SKU count per L1, and per L1+Category, read off each group's
+// already-deduplicated "OVERALL" cluster row (summing across clusters instead
+// would double-count SKUs stocked in more than one cluster).
+function storeCutSizeTotals(rows){
+  const l1Totals = {}, catTotals = {};
+  rows.forEach(r => {
+    if (r.cluster !== 'OVERALL') return;
+    l1Totals[r.l1] = (l1Totals[r.l1] || 0) + (r.unique_option_count || 0);
+    const key = r.l1 + '||' + r.cat;
+    catTotals[key] = (catTotals[key] || 0) + (r.unique_option_count || 0);
+  });
+  return { l1Totals, catTotals };
+}
+// L1 blocks ordered by total SKU count desc (so e.g. Snitch, with the most
+// SKUs, leads), categories within each L1 also ordered by SKU count desc,
+// then Meta1-3 and cluster (alphabetical, "OVERALL" always last) as before.
+function storeCutSizeSort(l1Totals, catTotals){
+  return (a, b) => {
+    const la = l1Totals[a.l1] || 0, lb = l1Totals[b.l1] || 0;
+    if (la !== lb) return lb - la;
+    if (a.l1 !== b.l1) return (a.l1 || '') < (b.l1 || '') ? -1 : 1;
+    const ca = catTotals[a.l1 + '||' + a.cat] || 0, cb = catTotals[b.l1 + '||' + b.cat] || 0;
+    if (ca !== cb) return cb - ca;
+    if (a.cat !== b.cat) return (a.cat || '') < (b.cat || '') ? -1 : 1;
+    const groupA = [a.m1, a.m2, a.m3].map(v => v ?? '').join('|');
+    const groupB = [b.m1, b.m2, b.m3].map(v => v ?? '').join('|');
+    if (groupA !== groupB) return groupA < groupB ? -1 : 1;
+    const aOverall = a.cluster === 'OVERALL', bOverall = b.cluster === 'OVERALL';
+    if (aOverall !== bOverall) return aOverall ? 1 : -1;
+    return (a.cluster || '').localeCompare(b.cluster || '');
+  };
+}
+
+function storeCutSizePct(v){
+  return (v !== null && v !== undefined) ? v.toFixed(1) + '%' : '—';
+}
+function storeCutSizeRowHTML(r){
+  // Only the "winning" metric gets colored, not both cells: cut% in red when
+  // it exceeds full% (more stores missing a core size than carrying the
+  // complete run), full% in green when it's ahead. Equal or either null: no color.
+  const hasBoth = r.pct_cut !== null && r.pct_full !== null;
+  const cutCls = hasBoth && r.pct_cut > r.pct_full ? ' class="delta-behind"' : '';
+  const fullCls = hasBoth && r.pct_full > r.pct_cut ? ' class="delta-ahead"' : '';
+  const rowCls = r.cluster === 'OVERALL' ? ' class="overall-row"' : '';
+  return `<tr${rowCls}>
+    <td>${r.l1 || '—'}</td>
+    <td>${r.cat || '—'}</td>
+    <td>${r.m1 || '—'}</td>
+    <td>${r.m2 || '—'}</td>
+    <td>${r.m3 || '—'}</td>
+    <td class="rowlabel">${r.cluster}</td>
+    <td>${fmtNum(r.total_store_count_in_cluster)}</td>
+    <td>${fmtNum(r.unique_option_count)}</td>
+    <td>${fmtNum(r.store_count_with_cut_size)}</td>
+    <td${cutCls}>${storeCutSizePct(r.pct_cut)}</td>
+    <td${fullCls}>${storeCutSizePct(r.pct_full)}</td>
+  </tr>`;
+}
+
+function setStoreCutSizeCluster(v){
+  storeCutSizeCluster = v;
+  render();
+}
+
+function renderStoreCutSizeTab(f){
+  document.getElementById('kpi-row').innerHTML = '';
+  const allRows = (DATA.store_cut_size || []).filter(r => liveSkuMatchesFilter(r, f) && !storeCutSizeExcluded(r));
+
+  // Cluster list is built from the full (L1/Category/Meta-filtered) set, not
+  // the cluster-filtered one below, so picking a cluster doesn't shrink the
+  // dropdown's own option list out from under the user.
+  const clusters = [...new Set(allRows.map(r => r.cluster))].sort();
+  const overallIdx = clusters.indexOf('OVERALL');
+  if (overallIdx !== -1){ clusters.splice(overallIdx, 1); clusters.push('OVERALL'); }
+  if (storeCutSizeCluster !== 'ALL' && !clusters.includes(storeCutSizeCluster)) storeCutSizeCluster = 'ALL';
+
+  const clusterFilterHTML = `<div class="filter-group" style="margin-bottom:14px;">
+    <label>Cluster</label>
+    <select onchange="setStoreCutSizeCluster(this.value)">
+      <option value="ALL"${storeCutSizeCluster==='ALL'?' selected':''}>All Clusters</option>
+      ${clusters.map(c => `<option value="${c}"${c===storeCutSizeCluster?' selected':''}>${c}</option>`).join('')}
+    </select>
+  </div>`;
+
+  // Totals computed off allRows (L1/Category/Meta-filtered, but before the
+  // Cluster dropdown narrows it further) so sort order stays stable
+  // regardless of which single cluster the user picks.
+  const { l1Totals, catTotals } = storeCutSizeTotals(allRows);
+  const rows = allRows
+    .filter(r => storeCutSizeCluster === 'ALL' || r.cluster === storeCutSizeCluster)
+    .sort(storeCutSizeSort(l1Totals, catTotals));
+
+  if (!rows.length){
+    document.getElementById('storecutsize-root').innerHTML = clusterFilterHTML +
+      '<div class="empty-note">No rows match this filter.</div>';
+    return;
+  }
+  const header = `<th>L1</th><th>Category</th><th>Meta 1</th><th>Meta 2</th><th>Meta 3</th><th>Cluster</th>
+    <th>Total Store Count</th><th>Unique Options</th><th>Stores w/ Cut Size</th><th>% Cut</th><th>% Full</th>`;
+  document.getElementById('storecutsize-root').innerHTML = `
+    <div class="card-section">
+      <h2>Store Cut Size <span class="rule"></span> <span class="count">${rows.length} rows</span></h2>
+      ${clusterFilterHTML}
+      <div style="overflow:auto; max-height:70vh;">
+        <table class="svi-table">
+          <thead><tr>${header}</tr></thead>
+          <tbody>${rows.map(storeCutSizeRowHTML).join('')}</tbody>
+        </table>
+      </div>
+    </div>`;
+}
+
+// Category/Meta1-3 only -- Channel and L1 are intentionally ignored (L1 is
+// the grid split itself: Snitch/Luxe/Plus each get their own table below).
+function sviMatchesFilter(r, f){
+  if (f.cat !== 'ALL' && r.cat !== f.cat) return false;
+  if (f.m1 !== 'ALL' && r.m1 !== f.m1) return false;
+  if (f.m2 !== 'ALL' && r.m2 !== f.m2) return false;
+  if (f.m3 !== 'ALL' && r.m3 !== f.m3) return false;
+  return true;
+}
+
+const SVI_L1_GRIDS = [
+  {id:'snitch', title:'Snitch', l1:'snitch', sizes:['XS','S','M','L','XL','XXL']},
+  {id:'luxe',   title:'Luxe',   l1:'luxe',   sizes:['XS','S','M','L','XL','XXL']},
+  {id:'plus',   title:'Plus',   l1:'plus',   sizes:['3XL','4XL','5XL','6XL','7XL','8XL']},
+];
+const SVI_BLOCKS = [
+  {title:'Inwards',       metricKey:'inward'},
+  {title:'Overall Sales', metricKey:'overall'},
+  {title:'Offline',       metricKey:'store'},
+  {title:'Shopify',       metricKey:'shopify'},
+  {title:'MP',            metricKey:'mp'},
+];
+
+// Fixed-width label columns, frozen (position:sticky) while the block
+// columns scroll horizontally underneath them.
+const SVI_STICKY_COLS = [
+  {label:'Category', width:110},
+  {label:'Fit',       width:130},
+  {label:'Month',    width:90},
+];
+function sviStickyLeft(i){
+  let left = 0;
+  for (let j = 0; j < i; j++) left += SVI_STICKY_COLS[j].width;
+  return left;
+}
+
+// This tab only cares about fit as the size-curve split, not the full
+// Meta1/2/3 breakdown -- Meta1/2/3 are collapsed into one "Fit" field here,
+// sourced from whichever meta column actually holds fit for that category
+// (shirts/tshirts: meta3, jeans/trousers: meta1). Every other category falls
+// back to meta1 too, same field it always showed as its primary attribute.
+function sviFitOf(r){
+  const cat = (r.cat || '').toLowerCase();
+  if (cat === 'shirts' || cat === 'tshirts') return r.m3;
+  return r.m1; // jeans, trousers, and everything else
+}
+
+// One row per size, at L1 x Category x Fit x Month grain -- collapsed here
+// into one group per Category/Fit/Month combo, holding all its sizes' qty
+// so % share across sizes can be computed per metric.
+function sviBuildGroups(rows){
+  const groups = {};
+  rows.forEach(r => {
+    const fit = sviFitOf(r);
+    const key = [r.cat, fit, r.month_key].join('|');
+    if (!groups[key]){
+      groups[key] = { cat:r.cat, fit, month:r.month, month_key:r.month_key, sizeData:{} };
+    }
+    // Sum, not overwrite -- distinct meta2/meta3 rows now collapse into the
+    // same (cat, fit, month) group and can share a size, so their qty must add.
+    const sd = groups[key].sizeData;
+    const prev = sd[r.size] || { inward:0, mp:0, shopify:0, store:0 };
+    sd[r.size] = {
+      inward: prev.inward + r.inward_qty, mp: prev.mp + r.mp_qty,
+      shopify: prev.shopify + r.shopify_qty, store: prev.store + r.store_qty,
+    };
+  });
+  return Object.values(groups);
+}
+// Category order is driven by each category's total Overall Sales qty
+// (Marketplace+Shopify+Store, summed across every row) -- highest first --
+// not alphabetically. Fit and month stay as secondary/tertiary sort keys.
+function sviCategoryTotals(rows){
+  const totals = {};
+  rows.forEach(r => { totals[r.cat] = (totals[r.cat] || 0) + r.mp_qty + r.shopify_qty + r.store_qty; });
+  return totals;
+}
+function sviSort(catTotals){
+  return (a, b) => {
+    const ta = catTotals[a.cat] || 0, tb = catTotals[b.cat] || 0;
+    if (ta !== tb) return tb - ta;
+    if (a.cat !== b.cat) return (a.cat || '') < (b.cat || '') ? -1 : 1;
+    const ga = a.fit ?? '', gb = b.fit ?? '';
+    if (ga !== gb) return ga < gb ? -1 : 1;
+    return (b.month_key || '').localeCompare(a.month_key || ''); // most recent month first
+  };
+}
+
+// % share of this group's total for `metricKey`, across `sizes` -- plus a
+// Total column (sum of the %s) as a sanity check, expected to read ~100%.
+function sviBlockPct(group, sizes, metricKey){
+  const values = sizes.map(sz => {
+    const d = group.sizeData[sz];
+    if (!d) return 0;
+    if (metricKey === 'overall') return d.mp + d.shopify + d.store;
+    return d[metricKey]; // 'inward' | 'store' | 'shopify' | 'mp' match sizeData's own keys
+  });
+  const total = values.reduce((a, b) => a + b, 0);
+  const pcts = values.map(v => total > 0 ? (v / total * 100) : null);
+  const pctTotal = total > 0 ? pcts.reduce((a, p) => a + p, 0) : null;
+  return { pcts, pctTotal };
+}
+// Indices of the 3 highest non-null % values in a block, for green highlighting.
+function sviTop3Indices(pcts){
+  return new Set(
+    pcts.map((p, i) => ({ p, i })).filter(x => x.p !== null)
+        .sort((a, b) => b.p - a.p).slice(0, 3).map(x => x.i)
+  );
+}
+
+// Blank Fit is meaningless for the four categories the Fit column is built
+// for (it's their sole split field now) -- dropped there. Left alone for
+// every other category, where a blank fallback (meta1) is expected/normal.
+const SVI_FIT_CATEGORIES = new Set(['shirts', 'tshirts', 'jeans', 'trousers']);
+function sviBlankFitExcluded(r){
+  const cat = (r.cat || '').toLowerCase();
+  if (!SVI_FIT_CATEGORIES.has(cat)) return false;
+  const fit = sviFitOf(r);
+  return !fit || !fit.trim();
+}
+
+function sviHeaderHTML(sizes){
+  const stickyTop = SVI_STICKY_COLS.map((c, i) => {
+    const lastSticky = i === SVI_STICKY_COLS.length - 1;
+    return `<th rowspan="2" class="svi-sticky${lastSticky ? ' svi-block-end' : ''}" style="left:${sviStickyLeft(i)}px; width:${c.width}px;">${c.label}</th>`;
+  }).join('');
+  const top = SVI_BLOCKS.map(b => `<th colspan="${sizes.length + 1}">${b.title}</th>`).join('');
+  const sub = SVI_BLOCKS.map(() =>
+    sizes.map(sz => `<th>${sz}</th>`).join('') + '<th class="svi-block-end">Total</th>'
+  ).join('');
+  return `<tr>${stickyTop}${top}</tr><tr>${sub}</tr>`;
+}
+// Renders one row from a set of per-size qty (either a single month's group,
+// or a merged multi-month total) -- shared by ordinary rows and total rows.
+function sviRowHTMLFromSizeData(catLabel, fitLabel, monthLabel, sizeData, sizes, rowClass){
+  const pseudoGroup = { sizeData };
+  const blocks = SVI_BLOCKS.map(b => {
+    const { pcts, pctTotal } = sviBlockPct(pseudoGroup, sizes, b.metricKey);
+    const top3 = sviTop3Indices(pcts);
+    const sizeCells = pcts.map((p, i) =>
+      `<td${top3.has(i) ? ' class="svi-top3"' : ''}>${p === null ? '—' : p.toFixed(1) + '%'}</td>`
+    ).join('');
+    return sizeCells + `<td class="svi-block-end">${pctTotal === null ? '—' : pctTotal.toFixed(1) + '%'}</td>`;
+  }).join('');
+  const stickyCells = [catLabel, fitLabel, monthLabel].map((v, i) => {
+    const lastSticky = i === SVI_STICKY_COLS.length - 1;
+    return `<td class="svi-sticky${lastSticky ? ' svi-block-end' : ''}" style="left:${sviStickyLeft(i)}px; width:${SVI_STICKY_COLS[i].width}px;">${v || '—'}</td>`;
+  }).join('');
+  return `<tr${rowClass ? ` class="${rowClass}"` : ''}>${stickyCells}${blocks}</tr>`;
+}
+function sviRowHTML(group, sizes){
+  return sviRowHTMLFromSizeData(group.cat, group.fit, group.month, group.sizeData, sizes);
+}
+
+// Sums qty per size across a list of month-groups -- used for both the
+// per-fit subtotal (all months, one fit) and the per-category grand total
+// (all months, every fit).
+function sviMergeSizeData(list){
+  const merged = {};
+  list.forEach(g => {
+    Object.entries(g.sizeData).forEach(([sz, d]) => {
+      const prev = merged[sz] || { inward:0, mp:0, shopify:0, store:0 };
+      merged[sz] = {
+        inward: prev.inward + d.inward, mp: prev.mp + d.mp,
+        shopify: prev.shopify + d.shopify, store: prev.store + d.store,
+      };
+    });
+  });
+  return merged;
+}
+// Expects `groups` pre-sorted (category by sales desc, then fit, then month
+// desc). Walks it once, inserting a "<Fit> — Total" row after every fit's run
+// of months, and one "Final Split" row after every category's last fit.
+function sviBuildDisplayRows(groups){
+  const items = [];
+  let i = 0;
+  while (i < groups.length){
+    const cat = groups[i].cat;
+    const catMonthGroups = [];
+    while (i < groups.length && groups[i].cat === cat){
+      const fit = groups[i].fit;
+      const fitMonthGroups = [];
+      while (i < groups.length && groups[i].cat === cat && groups[i].fit === fit){
+        items.push({ kind:'month', group: groups[i] });
+        fitMonthGroups.push(groups[i]);
+        i++;
+      }
+      items.push({ kind:'fit-total', cat, fit, sizeData: sviMergeSizeData(fitMonthGroups) });
+      catMonthGroups.push(...fitMonthGroups);
+    }
+    items.push({ kind:'cat-total', cat, sizeData: sviMergeSizeData(catMonthGroups) });
+  }
+  return items;
+}
+function sviDisplayRowHTML(item, sizes){
+  if (item.kind === 'month') return sviRowHTML(item.group, sizes);
+  if (item.kind === 'fit-total') return sviRowHTMLFromSizeData(item.cat, `${item.fit} — Total`, '—', item.sizeData, sizes, 'svi-fit-total');
+  return sviRowHTMLFromSizeData(item.cat, 'Final Split', '—', item.sizeData, sizes, 'svi-cat-total');
+}
+
+function renderSalesVsInwardsTab(f){
+  document.getElementById('kpi-row').innerHTML = '';
+  const cur = currentMonthKey();
+  const rows = (DATA.sales_vs_inwards || [])
+    .filter(r => sviMatchesFilter(r, f) && r.month_key !== cur && !sviBlankFitExcluded(r));
+
+  const sections = SVI_L1_GRIDS.map(grid => {
+    const gridRows = rows.filter(r => (r.l1 || '').toLowerCase() === grid.l1);
+    const catTotals = sviCategoryTotals(gridRows);
+    const groups = sviBuildGroups(gridRows).sort(sviSort(catTotals));
+    const colCount = SVI_STICKY_COLS.length + SVI_BLOCKS.length * (grid.sizes.length + 1);
+    const displayRows = sviBuildDisplayRows(groups);
+    const body = groups.length
+      ? displayRows.map(item => sviDisplayRowHTML(item, grid.sizes)).join('')
+      : `<tr><td class="rowlabel dash" colspan="${colCount}">No data in this slice</td></tr>`;
+    return `<div class="card-section">
+      <h2>${grid.title} <span class="rule"></span> <span class="count">${groups.length} rows</span></h2>
+      <div style="overflow:auto; max-height:70vh;">
+        <table class="svi-table">
+          <thead>${sviHeaderHTML(grid.sizes)}</thead>
+          <tbody>${body}</tbody>
+        </table>
+      </div>
+    </div>`;
+  }).join('');
+
+  document.getElementById('salesvsinwards-root').innerHTML = sections;
+}
+
+// Same blank/long_tail L1 and blank/(nil) category guards as Store Cut Size.
+function storeReturnsExcluded(r){
+  const l1 = (r.l1 || '').trim().toUpperCase().replace(/_/g, ' ');
+  if (l1 === '' || l1 === 'LONG TAIL') return true;
+  const cat = (r.cat || '').trim().toUpperCase();
+  if (cat === '' || cat === '(NIL)') return true;
+  return false;
+}
+// L1/Category/Meta1-3 all apply (unlike Sales vs Inwards, L1 is a row label
+// here, not a grid split, so filtering by it is meaningful). Channel ignored.
+function storeReturnsMatchesFilter(r, f){
+  if (f.l1 !== 'ALL' && r.l1 !== f.l1) return false;
+  if (f.cat !== 'ALL' && r.cat !== f.cat) return false;
+  if (f.m1 !== 'ALL' && r.m1 !== f.m1) return false;
+  if (f.m2 !== 'ALL' && r.m2 !== f.m2) return false;
+  if (f.m3 !== 'ALL' && r.m3 !== f.m3) return false;
+  return true;
+}
+// Same "Fit" derivation as the Sales vs Inwards tab's Meta4 column.
+function storeReturnsFitOf(r){
+  const cat = (r.cat || '').toLowerCase();
+  if (cat === 'shirts' || cat === 'tshirts') return r.m3;
+  return r.m1;
+}
+const FULL_MONTH_NAMES = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+function monthLabelFull(monthKey){
+  if (!monthKey) return '—';
+  const [, m] = monthKey.split('-').map(Number);
+  return FULL_MONTH_NAMES[m - 1];
+}
+
+function storeReturnsL1CatTotals(rows){
+  const l1Totals = {}, catTotals = {};
+  rows.forEach(r => {
+    l1Totals[r.l1] = (l1Totals[r.l1] || 0) + r.qty;
+    const key = r.l1 + '||' + r.cat;
+    catTotals[key] = (catTotals[key] || 0) + r.qty;
+  });
+  return { l1Totals, catTotals };
+}
+// Groups into one row per (row-key), each holding a month_key -> {qty,cogs}
+// map -- months become columns when rendered, instead of separate rows.
+function storeReturnsGroupByRow(rows, rowKeyFn, rowLabelFn){
+  const map = {};
+  rows.forEach(r => {
+    const k = rowKeyFn(r);
+    if (!map[k]) map[k] = { ...rowLabelFn(r), byMonth: {} };
+    const bm = map[k].byMonth;
+    if (!bm[r.month_key]) bm[r.month_key] = { qty: 0, cogs: 0 };
+    bm[r.month_key].qty += r.qty;
+    bm[r.month_key].cogs += r.cogs_value;
+  });
+  return Object.values(map);
+}
+// A category "has meta" if it resolves to more than one distinct Fit value
+// (shirts/tshirts/jeans/trousers) -- everything else (cargo pants, jackets,
+// etc.) always falls back to a single blank Fit and counts as "no meta".
+function storeReturnsCategoryHasMeta(rows){
+  const fitsByCat = {};
+  rows.forEach(r => {
+    const key = r.l1 + '||' + r.cat;
+    (fitsByCat[key] = fitsByCat[key] || new Set()).add(storeReturnsFitOf(r) || '');
+  });
+  const hasMeta = {};
+  Object.entries(fitsByCat).forEach(([key, set]) => { hasMeta[key] = set.size > 1; });
+  return hasMeta;
+}
+// L1 by total returns desc; within L1, categories with meta (a real Fit
+// split) before categories without; within that tier, category by total
+// returns desc; then (grid 3 only) Fit alphabetically. No month tiebreak
+// needed -- month is now a set of columns on each row, not part of row identity.
+function storeReturnsRowSort(l1Totals, catTotals, hasMeta, withFit){
+  return (a, b) => {
+    const la = l1Totals[a.l1] || 0, lb = l1Totals[b.l1] || 0;
+    if (la !== lb) return lb - la;
+    if (a.l1 !== b.l1) return (a.l1 || '') < (b.l1 || '') ? -1 : 1;
+    const ha = hasMeta[a.l1 + '||' + a.cat] ? 1 : 0, hb = hasMeta[b.l1 + '||' + b.cat] ? 1 : 0;
+    if (ha !== hb) return hb - ha;
+    const ca = catTotals[a.l1 + '||' + a.cat] || 0, cb = catTotals[b.l1 + '||' + b.cat] || 0;
+    if (ca !== cb) return cb - ca;
+    if (a.cat !== b.cat) return (a.cat || '') < (b.cat || '') ? -1 : 1;
+    if (withFit){
+      const fa = a.fit ?? '', fb = b.fit ?? '';
+      if (fa !== fb) return fa < fb ? -1 : 1;
+    }
+    return 0;
+  };
+}
+
+// Sums byMonth maps across a list of rows -- used for both the Grid 2 L1
+// total and the Grid 3 Category total.
+function storeReturnsMergeByMonth(list){
+  const merged = {};
+  list.forEach(item => {
+    Object.entries(item.byMonth).forEach(([m, d]) => {
+      if (!merged[m]) merged[m] = { qty: 0, cogs: 0 };
+      merged[m].qty += d.qty;
+      merged[m].cogs += d.cogs;
+    });
+  });
+  return merged;
+}
+// Grid 2 (rows pre-sorted L1 desc, then Category desc): inserts one
+// "<L1> — Total" row after every L1's run of categories.
+function storeReturnsBuildG2Display(g2Items){
+  const out = [];
+  let i = 0;
+  while (i < g2Items.length){
+    const l1 = g2Items[i].l1;
+    const l1Items = [];
+    while (i < g2Items.length && g2Items[i].l1 === l1){
+      out.push({ kind:'row', item: g2Items[i] });
+      l1Items.push(g2Items[i]);
+      i++;
+    }
+    out.push({ kind:'l1-total', l1, byMonth: storeReturnsMergeByMonth(l1Items) });
+  }
+  return out;
+}
+// Grid 3 (rows pre-sorted L1 desc, Category desc, Fit alpha): inserts one
+// "<Category> — Total" row after every Category's run of fits, and one
+// "<L1> — Total" row after every L1's run of categories.
+function storeReturnsBuildG3Display(g3Items){
+  const out = [];
+  let i = 0;
+  while (i < g3Items.length){
+    const l1 = g3Items[i].l1;
+    const l1Items = [];
+    while (i < g3Items.length && g3Items[i].l1 === l1){
+      const cat = g3Items[i].cat;
+      const catItems = [];
+      while (i < g3Items.length && g3Items[i].l1 === l1 && g3Items[i].cat === cat){
+        out.push({ kind:'row', item: g3Items[i] });
+        catItems.push(g3Items[i]);
+        l1Items.push(g3Items[i]);
+        i++;
+      }
+      // Categories with no real Fit split (cargo pants, jackets, etc.) fall
+      // back to a single blank-Fit row -- a Total there would just duplicate
+      // it, so only add the Total when there's more than one Fit to sum.
+      if (catItems.length > 1){
+        out.push({ kind:'cat-total', l1, cat, byMonth: storeReturnsMergeByMonth(catItems) });
+      }
+    }
+    out.push({ kind:'l1-total', l1, byMonth: storeReturnsMergeByMonth(l1Items) });
+  }
+  return out;
+}
+
+// Grid 1: two rows (Units, COGS), one column per month.
+function storeReturnsGrid1TableHTML(g1Rows){
+  if (!g1Rows.length) return '<div class="empty-note">No data.</div>';
+  const monthTh = g1Rows.map(r => `<th>${r.label}</th>`).join('');
+  const unitsTd = g1Rows.map(r => `<td>${fmtNum(r.qty)}</td>`).join('');
+  const cogsTd = g1Rows.map(r => `<td>${fmtMoney(r.cogs)}</td>`).join('');
+  return `<table class="svi-table">
+    <thead><tr><th>Metric</th>${monthTh}</tr></thead>
+    <tbody>
+      <tr><td class="rowlabel">Units</td>${unitsTd}</tr>
+      <tr><td class="rowlabel">COGS</td>${cogsTd}</tr>
+    </tbody>
+  </table>`;
+}
+// Simple dual-line trend -- Units and COGS live on very different scales, so
+// each line is normalized to its own min/max rather than sharing one axis.
+// Native <title> tooltips on each point show the exact value on hover.
+function storeReturnsTrendChart(g1Rows){
+  if (!g1Rows.length) return '<div class="empty-note">No data.</div>';
+  const W = 480, H = 190, padX = 30, padTop = 24, padBottom = 30;
+  const innerW = W - padX * 2, innerH = H - padTop - padBottom;
+  const n = g1Rows.length;
+  const maxQty = Math.max(...g1Rows.map(r => r.qty), 1);
+  const maxCogs = Math.max(...g1Rows.map(r => r.cogs), 1);
+  const xOf = i => padX + (n === 1 ? innerW / 2 : i * innerW / (n - 1));
+  const yOfQty = v => padTop + innerH - (v / maxQty * innerH);
+  const yOfCogs = v => padTop + innerH - (v / maxCogs * innerH);
+  const qtyPts = g1Rows.map((r, i) => `${xOf(i).toFixed(1)},${yOfQty(r.qty).toFixed(1)}`).join(' ');
+  const cogsPts = g1Rows.map((r, i) => `${xOf(i).toFixed(1)},${yOfCogs(r.cogs).toFixed(1)}`).join(' ');
+  const dots = (kind, color) => g1Rows.map((r, i) => {
+    const [x, y] = kind === 'qty' ? [xOf(i), yOfQty(r.qty)] : [xOf(i), yOfCogs(r.cogs)];
+    const val = kind === 'qty' ? fmtNum(r.qty) + ' units' : fmtMoney(r.cogs);
+    return `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="4.5" style="fill:${color}; cursor:pointer;"><title>${r.label}: ${val}</title></circle>`;
+  }).join('');
+  const labels = g1Rows.map((r, i) => `<text x="${xOf(i).toFixed(1)}" y="${H - 8}" text-anchor="middle" style="font-family:'IBM Plex Mono',monospace; font-size:10px; fill:var(--text-faint); text-transform:uppercase;">${r.label}</text>`).join('');
+  return `<div style="max-width:${W}px; margin:0 auto;">
+    <svg viewBox="0 0 ${W} ${H}" style="width:100%; height:${H}px; display:block;">
+      <polyline points="${qtyPts}" style="fill:none; stroke:var(--amber); stroke-width:2;"></polyline>
+      <polyline points="${cogsPts}" style="fill:none; stroke:var(--thread); stroke-width:2;"></polyline>
+      ${dots('qty', 'var(--amber)')}${dots('cogs', 'var(--thread)')}${labels}
+    </svg>
+    <div style="display:flex; gap:16px; justify-content:center; margin-top:6px; font-family:'IBM Plex Mono',monospace; font-size:11px; color:var(--text-dim);">
+      <span><span style="display:inline-block;width:10px;height:10px;background:var(--amber);border-radius:2px;margin-right:5px;"></span>Units</span>
+      <span><span style="display:inline-block;width:10px;height:10px;background:var(--thread);border-radius:2px;margin-right:5px;"></span>COGS</span>
+    </div>
+  </div>`;
+}
+// Grid 2/3: one row per (L1, Category[, Fit]), one Units+COGS column pair per
+// month, plus the total rows built by storeReturnsBuildG2Display/G3Display
+// (kind: 'row' | 'l1-total' | 'cat-total') -- reuses the same bold tan-tinted
+// styling as the Sales vs Inwards tab's subtotal/grand-total rows.
+function storeReturnsBreakdownTableHTML(displayItems, months, withFit){
+  if (!displayItems.length) return '<div class="empty-note">No data.</div>';
+  const leadTh = withFit ? '<th rowspan="2">L1</th><th rowspan="2">Category</th><th rowspan="2">Fit</th>'
+                         : '<th rowspan="2">L1</th><th rowspan="2">Category</th>';
+  const monthTh = months.map(m => `<th colspan="2">${monthLabelFull(m)}</th>`).join('');
+  const subTh = months.map(() => '<th>Units</th><th>COGS</th>').join('');
+  const monthCells = byMonth => months.map(m => {
+    const d = byMonth[m];
+    return `<td>${d ? fmtNum(d.qty) : '—'}</td><td>${d ? fmtMoney(d.cogs) : '—'}</td>`;
+  }).join('');
+  const body = displayItems.map(di => {
+    if (di.kind === 'row'){
+      const it = di.item;
+      const leadTd = withFit
+        ? `<td>${it.l1 || '—'}</td><td>${it.cat || '—'}</td><td>${it.fit || '—'}</td>`
+        : `<td>${it.l1 || '—'}</td><td>${it.cat || '—'}</td>`;
+      return `<tr>${leadTd}${monthCells(it.byMonth)}</tr>`;
+    }
+    if (di.kind === 'cat-total'){
+      const leadTd = withFit
+        ? `<td>${di.l1 || '—'}</td><td>${di.cat} — Total</td><td>—</td>`
+        : `<td>${di.l1 || '—'}</td><td>${di.cat} — Total</td>`;
+      return `<tr class="svi-fit-total">${leadTd}${monthCells(di.byMonth)}</tr>`;
+    }
+    const leadTd = withFit
+      ? `<td>${di.l1} — Total</td><td>—</td><td>—</td>`
+      : `<td>${di.l1} — Total</td><td>—</td>`;
+    return `<tr class="svi-cat-total">${leadTd}${monthCells(di.byMonth)}</tr>`;
+  }).join('');
+  return `<table class="svi-table">
+    <thead><tr>${leadTh}${monthTh}</tr><tr>${subTh}</tr></thead>
+    <tbody>${body}</tbody>
+  </table>`;
+}
+
+function renderStoreReturnsTab(f){
+  document.getElementById('kpi-row').innerHTML = '';
+  const rows = (DATA.store_returns || []).filter(r => storeReturnsMatchesFilter(r, f) && !storeReturnsExcluded(r));
+  const months = [...new Set(rows.map(r => r.month_key))].sort();
+
+  const g1Map = {};
+  rows.forEach(r => {
+    if (!g1Map[r.month_key]) g1Map[r.month_key] = { qty: 0, cogs: 0 };
+    g1Map[r.month_key].qty += r.qty;
+    g1Map[r.month_key].cogs += r.cogs_value;
+  });
+  const g1Rows = months.map(mk => ({
+    month_key: mk, label: monthLabelFull(mk), qty: g1Map[mk].qty, cogs: g1Map[mk].cogs,
+  }));
+
+  const { l1Totals, catTotals } = storeReturnsL1CatTotals(rows);
+  const hasMeta = storeReturnsCategoryHasMeta(rows);
+
+  const g2Items = storeReturnsGroupByRow(rows,
+    r => r.l1 + '|' + r.cat,
+    r => ({ l1: r.l1, cat: r.cat })
+  ).sort(storeReturnsRowSort(l1Totals, catTotals, hasMeta, false));
+
+  const g3Items = storeReturnsGroupByRow(rows,
+    r => r.l1 + '|' + r.cat + '|' + storeReturnsFitOf(r),
+    r => ({ l1: r.l1, cat: r.cat, fit: storeReturnsFitOf(r) })
+  ).sort(storeReturnsRowSort(l1Totals, catTotals, hasMeta, true));
+
+  const g2Display = storeReturnsBuildG2Display(g2Items);
+  const g3Display = storeReturnsBuildG3Display(g3Items);
+
+  document.getElementById('storereturns-root').innerHTML = `
+    <div class="card-section">
+      <h2>MoM Returns <span class="rule"></span></h2>
+      <div style="overflow-x:auto;">${storeReturnsGrid1TableHTML(g1Rows)}</div>
+      <div style="margin-top:22px;">${storeReturnsTrendChart(g1Rows)}</div>
+    </div>
+    <div class="card-section">
+      <h2>Category <span class="rule"></span> <span class="count">${g2Items.length} rows</span></h2>
+      <div style="overflow-x:auto;">${storeReturnsBreakdownTableHTML(g2Display, months, false)}</div>
+    </div>
+    <div class="card-section">
+      <h2>Category × Fit <span class="rule"></span> <span class="count">${g3Items.length} rows</span></h2>
+      <div style="overflow-x:auto;">${storeReturnsBreakdownTableHTML(g3Display, months, true)}</div>
+    </div>`;
 }
 
 function clicksMonthlyExcluded(r){
